@@ -1,0 +1,101 @@
+"""Unsigned boto3 access to the Unidata NEXRAD Level 2 mirror on S3.
+
+The Unidata mirror (``s3://unidata-nexrad-level2``) is fully public-read, so no
+AWS credentials are needed. Files there are gzipped (``.gz`` suffix); PyART's
+``read_nexrad_archive`` decompresses transparently.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from threading import Lock
+
+import boto3
+from botocore import UNSIGNED
+from botocore.config import Config
+
+from .cache import HashedCache
+
+BUCKET = "unidata-nexrad-level2"
+
+# Level 2 filenames: KTLX20130520_204812_V06[.gz]  or  KTLX20130520_204812[.gz]
+_KEY_RE = re.compile(r"^([A-Z]{4})(\d{8})_(\d{6})(?:_V\d+)?(?:\.gz)?$")
+
+_client_lock = Lock()
+_s3_client = None
+
+
+def s3_client():
+    """Lazy-initialized unsigned boto3 S3 client (shared across the process)."""
+    global _s3_client
+    with _client_lock:
+        if _s3_client is None:
+            _s3_client = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+        return _s3_client
+
+
+@dataclass(frozen=True)
+class ScanRef:
+    """A single volume scan listing entry."""
+
+    site: str          # ICAO
+    time: datetime     # UTC, parsed from the filename
+    key: str           # full S3 object key
+
+
+def list_volumes_for_day(site: str, day: datetime) -> list[ScanRef]:
+    """List all Level 2 volume keys for ``site`` on the UTC calendar day of ``day``."""
+    site = site.upper()
+    if day.tzinfo is None:
+        day = day.replace(tzinfo=timezone.utc)
+    prefix = f"{day:%Y/%m/%d}/{site}/"
+    out: list[ScanRef] = []
+    paginator = s3_client().get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []) or []:
+            k = obj["Key"]
+            if k.endswith("_MDM"):
+                continue
+            base = k.split("/")[-1]
+            m = _KEY_RE.match(base)
+            if not m:
+                continue
+            _, ymd, hms = m.groups()
+            t = datetime.strptime(ymd + hms, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+            out.append(ScanRef(site=site, time=t, key=k))
+    out.sort(key=lambda r: r.time)
+    return out
+
+
+def list_volumes_in_window(site: str, start: datetime, end: datetime) -> list[ScanRef]:
+    """All volumes for ``site`` whose scan time falls in ``[start, end]`` (UTC).
+
+    Spans the day boundary if needed (window may cross midnight UTC).
+    """
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    out: list[ScanRef] = []
+    d = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+    end_day = datetime(end.year, end.month, end.day, tzinfo=timezone.utc)
+    while d <= end_day:
+        out.extend(list_volumes_for_day(site, d))
+        d += timedelta(days=1)
+    return [r for r in out if start <= r.time <= end]
+
+
+def download_volume(scan: ScanRef, cache: HashedCache) -> Path:
+    """Download (with caching) a single Level 2 volume from S3. Returns local path.
+
+    Uses an atomic ``.part`` → final rename so partial files never appear complete.
+    """
+    if cache.exists(scan.key):
+        return cache.path(scan.key)
+    tmp = cache.temp_path(scan.key)
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    s3_client().download_file(BUCKET, scan.key, str(tmp))
+    return cache.finalize(scan.key)
