@@ -130,6 +130,18 @@ PRODUCT_UNITS: dict[str, str] = {
 
 CORRECTED_VELOCITY_FIELD = "corrected_velocity"
 
+# Field names for which "fall back to plain 'velocity' if the named
+# field is missing" is the correct behavior. Used by the in-volume
+# sibling + cross-volume fallbacks when they have a candidate sweep
+# but the originally-requested velocity variant isn't on it (e.g. an
+# older volume that wasn't dealiased yet still has raw ``velocity``).
+# **Crucially**, the fallback MUST NOT fire for non-velocity requests
+# — substituting velocity for a missing ``cross_correlation_ratio`` /
+# ``differential_reflectivity`` and rendering the result through the
+# CC / ZDR colormap produces meaningless garbage (a uniform cyan
+# blanket on CC; uniform purple on ZDR) that looks like real data.
+_VELOCITY_FALLBACK_FIELDS = frozenset({"velocity", "corrected_velocity"})
+
 LAYOUT_DEFAULTS = {
     1: ("REF",),
     2: ("REF", "VEL"),
@@ -1127,7 +1139,15 @@ class RadarPanel(QFrame):
         if effective_sweep is not None:
             src = cross_radar if used_cross_volume else radar
             actual_field = field
-            if used_cross_volume and field not in src.fields and "velocity" in src.fields:
+            # Velocity-only fallback: a sibling/cross-volume sweep that
+            # lacks ``corrected_velocity`` (because it predates dealias
+            # or dealias failed for that file) is acceptably substituted
+            # with raw ``velocity``. Do NOT do this for non-velocity
+            # requests — see ``_VELOCITY_FALLBACK_FIELDS`` for why.
+            if (used_cross_volume
+                    and field in _VELOCITY_FALLBACK_FIELDS
+                    and field not in src.fields
+                    and "velocity" in src.fields):
                 actual_field = "velocity"
             if actual_field in src.fields:
                 data = src.fields[actual_field]["data"]
@@ -2424,7 +2444,15 @@ class RadarPanelGrid(QWidget):
                 log.warning("Cross-volume fallback: failed to load %s (%s)", ref.file, e)
                 continue
             actual_field = field
-            if actual_field not in radar.fields and "velocity" in radar.fields:
+            # Velocity-only fallback (see _VELOCITY_FALLBACK_FIELDS):
+            # an older volume that wasn't dealiased can substitute raw
+            # ``velocity`` for ``corrected_velocity``. NEVER substitute
+            # velocity for unrelated fields — rendering velocity values
+            # through the CC / ZDR / KDP colormap produced a uniform
+            # cyan/purple blanket that looked like real data.
+            if (field in _VELOCITY_FALLBACK_FIELDS
+                    and actual_field not in radar.fields
+                    and "velocity" in radar.fields):
                 actual_field = "velocity"
             if actual_field not in radar.fields:
                 continue
