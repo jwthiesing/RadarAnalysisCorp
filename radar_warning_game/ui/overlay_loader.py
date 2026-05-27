@@ -2,11 +2,14 @@
 
 Layers populated:
   - **State borders** (Cartopy admin_1 states_provinces, 10m).
-  - **Cities** (Cartopy populated_places with population field, 10m).
-  - **County borders** — *not yet implemented*. Natural Earth doesn't include
-    US counties at usable resolution; the plan calls for the US Census TIGER
-    cartographic boundary shapefile bundled with the app. Until that file
-    ships in ``resources/``, county overlays remain empty.
+  - **Cities** — union of Cartopy's Natural Earth populated_places (global
+    coverage for the world bbox) and a bundled GeoNames-derived US CSV
+    (``resources/cities/us_cities.csv``, ~22k entries) that fills in every
+    county seat plus every place ≥500 population. Natural Earth alone is
+    extremely sparse over rural CONUS — most counties had zero labeled
+    towns — so for any radar inside the US the GeoNames table is what the
+    user actually sees once they zoom in.
+  - **US counties** (bundled TIGER ``cb_*_us_county_500k.shp``).
 
 All geometry is projected into km east/north of the radar site for direct
 drawing on the radar panel's pre-existing km-coordinate axes.
@@ -14,6 +17,7 @@ drawing on the radar panel's pre-existing km-coordinate axes.
 
 from __future__ import annotations
 
+import csv
 import logging
 from functools import lru_cache
 from pathlib import Path
@@ -73,6 +77,11 @@ _COUNTIES_SHP = (
     / "resources" / "counties" / "cb_2023_us_county_500k.shp"
 )
 
+_US_CITIES_CSV = (
+    Path(__file__).resolve().parent.parent.parent
+    / "resources" / "cities" / "us_cities.csv"
+)
+
 
 @lru_cache(maxsize=4)
 def _load_state_geometries():
@@ -88,6 +97,45 @@ def _load_populated_places():
     path = shpreader.natural_earth(resolution="10m", category="cultural",
                                    name="populated_places")
     return list(shpreader.Reader(path).records())
+
+
+@lru_cache(maxsize=1)
+def _load_us_cities() -> list[tuple[str, str, float, float, int, str]]:
+    """Load the bundled GeoNames-derived US cities CSV.
+
+    Returns a list of ``(name, state, lat, lon, pop, feature_code)``
+    tuples. ``feature_code`` is the GeoNames code — ``PPLA2`` flags
+    county seats, ``PPLA`` flags state capitals — preserved so the
+    renderer could prioritize them in the future, though right now
+    every entry just lands in the same population-sorted candidate
+    pool.
+
+    Rebuild the CSV with ``scripts/build_us_cities.py`` to refresh
+    against the latest GeoNames cities500 dump.
+    """
+    if not _US_CITIES_CSV.exists():
+        log.warning(
+            "US cities CSV not found at %s — run scripts/build_us_cities.py "
+            "to populate; Natural Earth populated_places will be the only "
+            "city source until then",
+            _US_CITIES_CSV,
+        )
+        return []
+    out: list[tuple[str, str, float, float, int, str]] = []
+    with _US_CITIES_CSV.open(encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                lat = float(row["lat"])
+                lon = float(row["lon"])
+                pop = int(row["pop"] or 0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            out.append((
+                row.get("name", "?"), row.get("state", ""),
+                lat, lon, pop, row.get("feature", ""),
+            ))
+    return out
 
 
 @lru_cache(maxsize=4)
@@ -239,6 +287,15 @@ def build_overlays(site: Site, *, range_km: float = DEFAULT_RANGE_KM) -> Overlay
         log.warning("Failed to load state borders: %s", e)
 
     cities: list[CityPoint] = []
+    # Track (name_lower, rounded lat/lon) to suppress GeoNames/Natural-Earth
+    # duplicates — both sources include big metros so without dedup a label
+    # like "Dallas" would draw twice with identical text. Lat/lon are rounded
+    # to ~1 km so a tiny coordinate disagreement doesn't defeat the match.
+    seen: set[tuple[str, int, int]] = set()
+
+    def _dedup_key(name: str, lat: float, lon: float) -> tuple[str, int, int]:
+        return (name.casefold(), round(lat * 100), round(lon * 100))
+
     try:
         for record in _load_populated_places():
             attrs = record.attributes
@@ -246,13 +303,6 @@ def build_overlays(site: Site, *, range_km: float = DEFAULT_RANGE_KM) -> Overlay
                 pop = int(attrs.get("POP_MAX") or 0)
             except (TypeError, ValueError):
                 pop = 0
-            # Floor: include all small towns Natural Earth carries.
-            # At 10m resolution Natural Earth only has places ≥ ~500
-            # globally; the bbox cull below trims this to ~200 km
-            # around the radar so total count per panel stays modest.
-            # Lower than the old 1000 cutoff so the relaxation pass in
-            # ``_relayout_city_labels`` can backfill rural views with
-            # actual nearby towns instead of running dry.
             if pop < 200:
                 continue
             geom = record.geometry
@@ -261,8 +311,25 @@ def build_overlays(site: Site, *, range_km: float = DEFAULT_RANGE_KM) -> Overlay
                 continue
             name = str(attrs.get("NAME") or attrs.get("NAMEASCII") or "?")
             cities.append(CityPoint(name=name, lat=lat, lon=lon, pop=pop))
+            seen.add(_dedup_key(name, lat, lon))
     except Exception as e:  # noqa: BLE001
         log.warning("Failed to load populated places: %s", e)
+
+    # Layer in the GeoNames US cities — sparse rural CONUS doesn't get
+    # decent coverage from Natural Earth alone, so this fills in every
+    # county seat + every place ≥500 pop. Outside the US this is a no-op
+    # (the bbox filter rejects everything).
+    try:
+        for name, _state, lat, lon, pop, _feature in _load_us_cities():
+            if not (minx <= lon <= maxx and miny <= lat <= maxy):
+                continue
+            key = _dedup_key(name, lat, lon)
+            if key in seen:
+                continue
+            seen.add(key)
+            cities.append(CityPoint(name=name, lat=lat, lon=lon, pop=pop))
+    except Exception as e:  # noqa: BLE001
+        log.warning("Failed to load US cities CSV: %s", e)
 
     county_rings: list[np.ndarray] = []
     try:

@@ -161,13 +161,42 @@ class SweepIndex:
             return None
         return min(window, key=lambda s: abs(s.elev_deg - target_elev))
 
-    def available_elevations(self, time: datetime, *, window_sec: int = 300) -> list[float]:
-        """Sorted unique elevations available in volumes near ``time`` (one-volume window)."""
+    def available_elevations(self, time: datetime, *, window_sec: int = 660) -> list[float]:
+        """Sorted distinct elevation tilts near ``time``, clustered so each
+        returned entry maps to exactly one physical tilt.
+
+        Two old-data failure modes this guards against:
+
+        - **Noisy ``fixed_angle`` values.** Some legacy WSR-88D archives
+          report a tilt nominally at 0.5° as e.g. 0.483° in one volume and
+          0.512° in the next. Naive ``round(elev, 2)`` would emit
+          ``[0.48, 0.51]`` — two distinct bins — but ``at_elevation`` uses
+          a ±0.15° tolerance and resolves *both* to the same underlying
+          sweep set. Stepping ↑/↓ between adjacent bins then showed no
+          visible change (and could trap the user above the base tilt
+          because the path back required walking through bins that aliased
+          to whatever they were already viewing). Clustering within the
+          same ``ELEV_TOLERANCE_DEG`` ``at_elevation`` uses guarantees one
+          bin per tilt.
+        - **Window too narrow for clear-air VCPs.** VCP 31/32 take ~10 min
+          per volume; the prior ±5 min window dropped the base tilt out of
+          range when the user was viewing the top tilt of the only loaded
+          volume. ±11 min covers a full 10-min cycle from any sweep within
+          it, including legacy 6-min VCP 21 and modern 4-min SAILS volumes.
+        """
         with self._lock:
             ws = bisect.bisect_left(self._times, _add_seconds(time, -window_sec))
             we = bisect.bisect_right(self._times, _add_seconds(time, window_sec))
-            elevs = sorted({round(s.elev_deg, 2) for s in self._sweeps[ws:we]})
-        return elevs
+            raw = sorted({s.elev_deg for s in self._sweeps[ws:we]})
+        if not raw:
+            return []
+        clusters: list[list[float]] = [[raw[0]]]
+        for e in raw[1:]:
+            if e - clusters[-1][-1] < ELEV_TOLERANCE_DEG:
+                clusters[-1].append(e)
+            else:
+                clusters.append([e])
+        return [sum(c) / len(c) for c in clusters]
 
 
 # --------------------------- helpers ------------------------------------------

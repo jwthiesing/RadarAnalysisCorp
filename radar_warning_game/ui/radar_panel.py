@@ -1466,7 +1466,7 @@ class RadarPanel(QFrame):
         # Wide views still cap at the larger threshold for clutter
         # control; zoomed views show everything down to small towns.
         if view_w > 400.0:
-            pop_threshold = 25_000
+            pop_threshold = 10_000
         elif view_w > 150.0:
             pop_threshold = 5_000
         else:
@@ -1526,11 +1526,17 @@ class RadarPanel(QFrame):
 
         # Pass 2 — relax threshold to backfill toward the minimum.
         # Only runs when the first pass left us short, which mostly
-        # happens at deep zoom in rural areas.
+        # happens at deep zoom in rural areas. The hard 1,000 floor
+        # keeps tiny hamlets out of the labels even when the area is
+        # very rural — better to show fewer labels than to clutter the
+        # panel with population-200 places that nobody recognizes.
+        ABSOLUTE_POP_FLOOR = 1_000
         if len(self._city_label_items) < MIN_LABELED_CITIES:
             for cx, cy, name, pop in in_view:
                 if pop >= pop_threshold:
                     continue   # already considered in pass 1
+                if pop < ABSOLUTE_POP_FLOOR:
+                    continue
                 if len(self._city_label_items) >= MIN_LABELED_CITIES:
                     break
                 _try_place(cx, cy, name)

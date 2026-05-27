@@ -197,6 +197,31 @@ def test_hail_predicted_zero_no_hail_observed_gets_full_credit():
     assert ws.magnitude_bonus == pytest.approx(0.5)
 
 
+def test_canceled_warning_still_scores_during_active_period():
+    """A canceled warning isn't excluded from scoring — reports that
+    occurred between issue and cancel still verify it, earning normal
+    credit. Cancel just truncates the valid window; it doesn't void
+    the warning's scoring history."""
+    w = _w(wt=WarningType.TOR, duration_min=30)
+    w.canceled_at = _T0 + timedelta(minutes=15)
+    r_during = _r(time=_T0+timedelta(minutes=5), magnitude=2.0)
+    ws = score_single_warning(w, [r_during])
+    assert ws.is_false_alarm is False
+    assert ws.points == pytest.approx(BASE_TOR_POINTS)
+
+
+def test_canceled_warning_ignores_reports_after_cancel():
+    """Reports that occur after the cancel time don't verify a canceled
+    warning — by canceling the player effectively retracted the
+    forecast for the remaining window."""
+    w = _w(wt=WarningType.TOR, duration_min=30)
+    w.canceled_at = _T0 + timedelta(minutes=15)
+    r_after = _r(time=_T0+timedelta(minutes=20), magnitude=2.0)
+    ws = score_single_warning(w, [r_after])
+    assert ws.is_false_alarm is True
+    assert ws.points == pytest.approx(-BASE_TOR_FA_PENALTY)
+
+
 def test_tor_with_no_magnitudes_earns_no_magnitude_bonus():
     """A bare tornado warning (no hail, no EF) has nothing to score
     against, so magnitude_bonus is 0 — the player only earns base TOR

@@ -150,6 +150,48 @@ def test_available_elevations_filters_to_window(tmp_path, monkeypatch):
     assert 1.3 in elevs
 
 
+def test_available_elevations_clusters_noisy_legacy_angles():
+    """Legacy WSR-88D files sometimes report a single nominal tilt as
+    e.g. 0.483° in one volume and 0.512° in the next. The earlier
+    implementation rounded to 2dp and emitted both as distinct entries —
+    but ``at_elevation``'s ±0.15° tolerance resolved them to the same
+    sweep set, so stepping between them via ↑/↓ produced no visible
+    change. Clustering within ``ELEV_TOLERANCE_DEG`` collapses them
+    back to one bin so step_elevation can't get stuck."""
+    si = SweepIndex("KTLX")
+    si._sweeps = [
+        SweepRef("KTLX", _T0,                              0.483, Path("a"), 0),
+        SweepRef("KTLX", _T0 + timedelta(seconds=30),      1.443, Path("a"), 1),
+        SweepRef("KTLX", _T0 + timedelta(minutes=5),       0.512, Path("b"), 0),
+        SweepRef("KTLX", _T0 + timedelta(minutes=5, seconds=30), 1.453, Path("b"), 1),
+    ]
+    si._times = [s.start_time for s in si._sweeps]
+    elevs = si.available_elevations(_T0)
+    assert len(elevs) == 2
+    assert abs(elevs[0] - 0.5) < 0.05
+    assert abs(elevs[1] - 1.45) < 0.05
+
+
+def test_available_elevations_window_covers_clear_air_volume():
+    """VCP 31/32 take ~10 minutes per volume. From the highest tilt of
+    a single loaded volume, the base tilt must still be in the
+    available-elevations list — otherwise the user can't navigate back
+    to 0.5° via ↓."""
+    si = SweepIndex("KTLX")
+    # VCP 31 layout: 0.5, 1.5, 2.5, 3.5 spread over ~10 minutes.
+    elevs_in = [0.5, 1.5, 2.5, 3.5]
+    offsets_min = [0, 2.5, 5.0, 7.5]
+    si._sweeps = [
+        SweepRef("KTLX", _T0 + timedelta(minutes=off), el, Path("v"), i)
+        for i, (el, off) in enumerate(zip(elevs_in, offsets_min))
+    ]
+    si._times = [s.start_time for s in si._sweeps]
+    # Stand at the 3.5° sweep at T+7.5min and ask what's available.
+    elevs = si.available_elevations(_T0 + timedelta(minutes=7, seconds=30))
+    assert 0.5 in [round(e, 2) for e in elevs]
+    assert len(elevs) == 4
+
+
 def test_nearest_elevation_picks_closest(tmp_path, monkeypatch):
     si = SweepIndex("KTLX")
     refs = _synthetic_volume(tmp_path / "v.ar2v", _T0)
