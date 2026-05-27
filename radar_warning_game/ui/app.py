@@ -157,6 +157,39 @@ class MainWindow(QMainWindow):
         else:
             asyncio.ensure_future(self._begin_join_mode())
 
+    async def _async_exec(self, dlg: QDialog) -> int:
+        """Await a QDialog's completion without spinning a nested Qt
+        event loop. ``QDialog.exec()`` enters its own modal event loop
+        that conflicts with qasync — qasync hooks Qt's loop to step
+        asyncio tasks, but those steps re-enter the currently-running
+        coroutine (the one that called ``exec()``), and asyncio refuses
+        with ``RuntimeError: Cannot enter into task ... while another
+        task is being executed``.
+
+        Workaround: ``setModal(True) + show()`` displays the dialog
+        modally w.r.t. input (the parent window is grayed out) but
+        does *not* spin a nested event loop — control returns to the
+        caller immediately and qasync's main loop keeps running. We
+        await a Future tied to the dialog's ``finished`` signal so
+        the calling coroutine resumes when the user accepts/cancels."""
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+
+        def _done(result: int) -> None:
+            if not fut.done():
+                fut.set_result(int(result))
+
+        dlg.finished.connect(_done)
+        dlg.setModal(True)
+        dlg.show()
+        try:
+            return await fut
+        finally:
+            try:
+                dlg.finished.disconnect(_done)
+            except (TypeError, RuntimeError):
+                pass
+
     async def _begin_host_mode(self) -> None:
         """Start a HostTransport, show the room-status dialog while accepting peers."""
         self._host_transport = HostTransport(
@@ -175,13 +208,19 @@ class MainWindow(QMainWindow):
         # Hook the peer-joined callback to update the dialog list
         self._host_transport._on_peer_joined = lambda pid: room_dlg.add_peer(pid, pid)
         self._host_transport._on_peer_left = lambda pid: room_dlg.remove_peer(pid)
-        if room_dlg.exec() == QDialog.DialogCode.Accepted:
+        # Use _async_exec (not dlg.exec()) so the signaling_loop task we
+        # started in HostTransport.start() can keep ticking while we
+        # wait — otherwise qasync hits a re-entrancy RuntimeError as
+        # soon as the first WS frame arrives.
+        if await self._async_exec(room_dlg) == QDialog.DialogCode.Accepted:
             self._show_day_picker()
 
     async def _begin_join_mode(self) -> None:
         """Prompt for a room code, connect, wait for RoundSetup from host, then enter prefetch."""
         join_dlg = JoinRoomDialog(self)
-        if join_dlg.exec() != QDialog.DialogCode.Accepted:
+        # Non-blocking await (see _async_exec) — keeps qasync's loop
+        # ticking while the dialog is open.
+        if await self._async_exec(join_dlg) != QDialog.DialogCode.Accepted:
             self.close()
             return
         room_code = join_dlg.room_code()
