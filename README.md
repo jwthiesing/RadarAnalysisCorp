@@ -199,6 +199,53 @@ In the game's **Mode** dialog, set `ws://<that-host>:8765/ws` as the signaling U
 
 **NAT traversal:** uses Google + Twilio public STUN servers. Works on cone NATs (most home routers). **Symmetric NATs require a TURN server**, which we don't ship — affected players will see the WebRTC handshake fail. For private LAN play, no STUN is needed.
 
+### Hosting the signaling server from your laptop
+
+If you don't have a VPS, the signaling server runs fine on your laptop — you only need somewhere `ws://...` accessible to every player. The signaling traffic itself is tiny (SDP-offer / SDP-answer / a few KB per join), so a residential connection handles it without issue. Once peers' WebRTC DataChannels are up, **game-state traffic flows directly through the host's data channel**, not through your laptop's signaling server.
+
+Pick the path that matches who needs to reach you:
+
+**Same Wi-Fi only (no port forwarding needed):**
+```bash
+python -m signaling_server.server --host 0.0.0.0 --port 8765
+```
+Find your laptop's LAN IP (`ipconfig getifaddr en0` on macOS Wi-Fi; `ip route get 1` then look for `src` on Linux; `ipconfig` then "IPv4 Address" on Windows) and share `ws://<lan-ip>:8765/ws` with peers on the same network.
+
+**Friends on the open Internet (router port-forward):**
+1. Run the server with `--host 0.0.0.0 --port 8765` (the default).
+2. In your router admin page (usually `http://192.168.1.1` or `http://192.168.0.1`), find **Port Forwarding** — sometimes labeled NAT / Virtual Servers / Applications. Add a TCP rule:
+
+   | Field | Value |
+   |---|---|
+   | External port | 8765 |
+   | Internal port | 8765 |
+   | Internal IP | your laptop's LAN IP from above |
+   | Protocol | TCP |
+
+3. Find your public IP: `curl -s ifconfig.me`. Share `ws://<public-ip>:8765/ws` with peers.
+4. Sanity-check from outside your LAN (a phone on cellular works) before relying on it.
+
+Real-world gotchas with home port-forwarding:
+- **Dynamic public IPs**: most residential ISPs rotate yours every few days. Either re-share when it changes, or sign up for a free dynamic-DNS hostname (DuckDNS, No-IP) and hand peers `ws://yourname.duckdns.org:8765/ws`.
+- **CGNAT**: some ISPs (especially mobile / rural / cellular fallback) put you behind their own NAT and the public IP from `ifconfig.me` isn't directly reachable. If port-forwarding "looks right" but outside connections time out, this is the usual culprit. Use the tunnel option below.
+- **macOS sleep kills connections**: existing peers' WebRTC channels drop the moment your laptop sleeps. `caffeinate -i` for the duration of your session prevents that.
+- **Plain WebSocket, no TLS** — fine for friends-only ad-hoc sessions; do not expose this publicly. Signaling messages aren't encrypted on the wire and the protocol has no auth beyond "do you have the room code." For an Internet-facing deployment, terminate TLS at a reverse proxy (nginx, Caddy) or use a tunnel (next).
+
+**No router access / behind CGNAT (tunnel):**
+Outbound-only tunnels skip port forwarding entirely.
+
+```bash
+# ngrok (free tier has time-limited sessions)
+brew install ngrok            # or download from ngrok.com
+ngrok http 8765
+
+# Cloudflare Tunnel (free, no session time limit)
+brew install cloudflared
+cloudflared tunnel --url http://localhost:8765
+```
+
+Both spit out an `https://<random>.ngrok-free.app` / `https://<random>.trycloudflare.com` URL. WebSocket upgrades work on the http side, so tell peers to use `ws://<random>.ngrok-free.app/ws` — the tunnel routes it through to your local 8765 transparently. Cloudflare's free tunnels are the lower-friction option for play sessions longer than ngrok's free-tier idle limit.
+
 **Date blinding (honor-system):**
 - All player-facing timestamps go through `ui/time_format.py` and render as `HH:MM:SSZ` only
 - Radar cache files use SHA-1 filenames instead of the original `YYYY/MM/DD/...` keys
