@@ -80,7 +80,10 @@ def polygon_area_km2(polygon: Polygon) -> float:
 def polygon_fraction_of(inner: Polygon, outer: Polygon) -> float:
     """Fraction of ``outer``'s area covered by ``inner ∩ outer``.
 
-    Used for the MCD anti-spam cap (§8): an MCD can't cover >50 % of the game area.
+    General utility — useful for "how much of the game polygon does this
+    warning cover?" coverage metrics in scoring breakdowns. (The MCD
+    anti-spam cap used to live here but was switched to an absolute
+    km² maximum in :data:`session.MCD_MAX_AREA_KM2`.)
     Both polygons are projected to ``outer``'s centroid for consistency.
     """
     lat0, lon0 = outer.centroid_latlon

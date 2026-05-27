@@ -56,8 +56,18 @@ SOLO_TEAM_PREFIX = "solo:"
 
 # MCD anti-spam (plan §8). Enforced at session.issue_mcd so wire MCDs from
 # peers can't bypass the host UI's validation.
+#
+# The upper cap is an absolute area rather than a fraction of the game
+# polygon. The fraction-based rule was a poor proxy: small training
+# rounds (e.g. a county-scale game area) would force MCDs to be tiny
+# and stop them from representing realistic SPC-scale mesoscale
+# discussions; large continental rounds would allow MCDs that aren't
+# meaningfully bounded. 250,000 km² is roughly the area of a large
+# real-world MCD ("4-5 states worth"); generous enough for any
+# realistic forecast scenario but small enough to prevent blanket-
+# the-game-area abuse.
 MCD_MIN_AREA_KM2 = 200.0
-MCD_MAX_FRACTION_OF_GAME_POLY = 0.50
+MCD_MAX_AREA_KM2 = 250_000.0
 MCD_MIN_VERTICES = 4
 MCD_RATE_LIMIT_PER_TEAM = timedelta(minutes=30)
 
@@ -72,7 +82,11 @@ _ALLOWED_TRANSITIONS = {
     SessionState.LOBBY: {SessionState.TEAM_LOBBY, SessionState.SETUP, SessionState.ENDED},
     SessionState.TEAM_LOBBY: {SessionState.SETUP, SessionState.ENDED},
     SessionState.SETUP: {SessionState.PREFETCH, SessionState.ENDED},
-    SessionState.PREFETCH: {SessionState.PLAYING, SessionState.ENDED},
+    # PREFETCH can fall back to SETUP if the host cancels the prefetch
+    # to revise their radar selection (e.g. they enabled a site that
+    # has no archive data for the chosen day and want to deselect it
+    # before retrying).
+    SessionState.PREFETCH: {SessionState.PLAYING, SessionState.SETUP, SessionState.ENDED},
     SessionState.PLAYING: {SessionState.ENDED},
     SessionState.ENDED: set(),
 }
@@ -229,6 +243,18 @@ class GameSession:
             raise RuntimeError("Cannot enter PREFETCH without a round config")
         self._transition(SessionState.PREFETCH)
 
+    def cancel_prefetch(self) -> None:
+        """Abandon a started-but-not-yet-playing round. Returns the session
+        to ``SETUP`` so the host can revise their radar selection / day
+        and retry from the overview map. Idempotent — no-op if not in
+        ``PREFETCH``."""
+        if self.state != SessionState.PREFETCH:
+            return
+        # Clear the half-built round config so the next start path
+        # rebuilds it from scratch with the host's revised selections.
+        self.round_config = None
+        self._transition(SessionState.SETUP)
+
     def begin_play(self) -> None:
         if self.round_config is None:
             raise RuntimeError("Cannot begin play without a round config")
@@ -372,7 +398,7 @@ class GameSession:
 
         Wire MCDs from peers are validated here, not just in the dialog UI.
         """
-        from ..geo.polygons import polygon_area_km2, polygon_fraction_of
+        from ..geo.polygons import polygon_area_km2
         # At least one hazard PIB ≥ 1
         if pib_tornado == 0 and pib_wind == 0 and pib_hail == 0:
             raise MCDValidationError("MCD must have ≥1 hazard PIB > 0")
@@ -387,14 +413,12 @@ class GameSession:
             raise MCDValidationError(
                 f"MCD polygon area {area:.0f} km² < min {MCD_MIN_AREA_KM2:.0f} km²"
             )
-        # Max coverage of game polygon
-        if self.round_config is not None:
-            frac = polygon_fraction_of(polygon, self.round_config.game_polygon)
-            if frac > MCD_MAX_FRACTION_OF_GAME_POLY:
-                raise MCDValidationError(
-                    f"MCD covers {frac*100:.0f}% of game area, exceeds "
-                    f"{MCD_MAX_FRACTION_OF_GAME_POLY*100:.0f}% cap"
-                )
+        # Max area — absolute km² cap, independent of game-polygon size.
+        if area > MCD_MAX_AREA_KM2:
+            raise MCDValidationError(
+                f"MCD polygon area {area:.0f} km² exceeds max "
+                f"{MCD_MAX_AREA_KM2:.0f} km²"
+            )
         # Per-team rate limit
         team_mcds = [
             m for player_id, mcds in self.mcds_by_player.items()

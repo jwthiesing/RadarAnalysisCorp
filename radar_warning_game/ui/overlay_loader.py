@@ -20,6 +20,7 @@ from pathlib import Path
 
 import cartopy.io.shapereader as shpreader
 import numpy as np
+from shapely.geometry import LineString
 
 from ..data.sites import Site
 from ..geo.projection import latlon_to_xy_km
@@ -30,6 +31,41 @@ log = logging.getLogger(__name__)
 # Range-of-interest: don't bother projecting geometries that lie far outside any
 # radar's coverage (saves a lot of work at CONUS-scale shapefiles).
 DEFAULT_RANGE_KM = 350.0
+
+# Douglas-Peucker simplification tolerances (km, post-projection). Picked
+# so the simplification is sub-pixel at typical pan/zoom levels but cuts
+# ring vertex counts to a fraction of the raw shapefile. State borders
+# can lose more detail than counties because they're drawn thicker.
+#
+# At our deepest zoom-in (~20 km half-width on a 1024-px image →
+# ~40 m/pixel), 0.2 km of simplification == 5 px of detail loss. That's
+# visible only when you zoom hard *and* look right at a coast or river;
+# for a synoptic scrub-through it's invisible. The win on the paint
+# side is real: state-border total vertex count drops ~5-10× and county
+# count drops ~3-5×, with corresponding drops in QPainter ``drawPath``
+# time per frame.
+_SIMPLIFY_TOL_STATE_KM = 0.2
+_SIMPLIFY_TOL_COUNTY_KM = 0.1
+
+
+def _simplify_ring_km(arr: np.ndarray, tolerance_km: float) -> np.ndarray:
+    """Douglas-Peucker simplify a projected ``(N, 2)`` ring in km.
+
+    Short rings (≤4 vertices) are returned unchanged — the algorithm
+    can't meaningfully reduce them and the LineString round-trip would
+    cost more than it saves. ``preserve_topology=False`` is fine: these
+    rings are rendered as standalone lines, not as topology-bearing
+    administrative areas, so non-simple intersections at the
+    simplified-vertex level are visually irrelevant."""
+    if len(arr) <= 4:
+        return arr
+    line = LineString(arr)
+    simp = line.simplify(tolerance_km, preserve_topology=False)
+    out = np.asarray(simp.coords, dtype=np.float64)
+    # simplify() can collapse a tiny ring to <2 points; fall back.
+    if out.shape[0] < 2:
+        return arr
+    return out
 
 
 _COUNTIES_SHP = (
@@ -94,6 +130,84 @@ def _coords_of(geom):
                 yield list(hole.coords)
 
 
+@lru_cache(maxsize=4)
+def _load_country_border_geometries():
+    """Load country admin_0 border lines from Natural Earth."""
+    path = shpreader.natural_earth(resolution="50m", category="cultural",
+                                   name="admin_0_boundary_lines_land")
+    return list(shpreader.Reader(path).geometries())
+
+
+@lru_cache(maxsize=4)
+def _load_coastline_geometries():
+    """Load global coastline lines from Natural Earth."""
+    path = shpreader.natural_earth(resolution="50m", category="physical",
+                                   name="coastline")
+    return list(shpreader.Reader(path).geometries())
+
+
+def _rings_in_bbox_latlon(
+    geoms,
+    *,
+    minx: float, maxx: float, miny: float, maxy: float,
+) -> list[np.ndarray]:
+    """Return each line/polygon ring as an ``(N, 2)`` ``(lon, lat)`` array,
+    filtered to those that touch the bbox. Used by map widgets that draw
+    in plain lat/lon (no cartopy projection at draw time)."""
+    out: list[np.ndarray] = []
+    for geom in geoms:
+        gxmin, gymin, gxmax, gymax = geom.bounds
+        if gxmax < minx or gxmin > maxx or gymax < miny or gymin > maxy:
+            continue
+        for coords in _coords_of(geom):
+            if len(coords) < 2:
+                continue
+            arr = np.asarray(coords, dtype=np.float64)
+            out.append(arr)
+    return out
+
+
+@lru_cache(maxsize=2)
+def load_conus_lines_latlon() -> dict:
+    """Return state / country-border / coastline lines (CONUS bbox) as plain
+    lon/lat numpy arrays. Used by the pyqtgraph-based maps (host map, day
+    picker) — they don't need cartopy's projection machinery; lat/lon as
+    flat (x, y) is good enough at CONUS scale."""
+    minx, maxx, miny, maxy = -130.0, -60.0, 20.0, 55.0
+    states: list[np.ndarray] = []
+    try:
+        states = _rings_in_bbox_latlon(
+            _load_state_geometries(),
+            minx=minx, maxx=maxx, miny=miny, maxy=maxy,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("Failed to load state lines (lat/lon): %s", e)
+
+    borders: list[np.ndarray] = []
+    try:
+        borders = _rings_in_bbox_latlon(
+            _load_country_border_geometries(),
+            minx=minx, maxx=maxx, miny=miny, maxy=maxy,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("Failed to load borders (lat/lon): %s", e)
+
+    coastlines: list[np.ndarray] = []
+    try:
+        coastlines = _rings_in_bbox_latlon(
+            _load_coastline_geometries(),
+            minx=minx, maxx=maxx, miny=miny, maxy=maxy,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("Failed to load coastline (lat/lon): %s", e)
+
+    return {
+        "states": states,
+        "borders": borders,
+        "coastlines": coastlines,
+    }
+
+
 def build_overlays(site: Site, *, range_km: float = DEFAULT_RANGE_KM) -> OverlayBundle:
     """Build an :class:`OverlayBundle` centered on ``site``, limited to ``range_km``.
 
@@ -118,7 +232,9 @@ def build_overlays(site: Site, *, range_km: float = DEFAULT_RANGE_KM) -> Overlay
                 # Trim out points beyond ~range_km*1.5 from radar (cleaner)
                 dist = np.hypot(ring[:, 0], ring[:, 1])
                 if (dist < range_km * 1.5).any():
-                    state_rings.append(ring)
+                    state_rings.append(
+                        _simplify_ring_km(ring, _SIMPLIFY_TOL_STATE_KM)
+                    )
     except Exception as e:  # noqa: BLE001
         log.warning("Failed to load state borders: %s", e)
 
@@ -130,7 +246,14 @@ def build_overlays(site: Site, *, range_km: float = DEFAULT_RANGE_KM) -> Overlay
                 pop = int(attrs.get("POP_MAX") or 0)
             except (TypeError, ValueError):
                 pop = 0
-            if pop < 1000:
+            # Floor: include all small towns Natural Earth carries.
+            # At 10m resolution Natural Earth only has places ≥ ~500
+            # globally; the bbox cull below trims this to ~200 km
+            # around the radar so total count per panel stays modest.
+            # Lower than the old 1000 cutoff so the relaxation pass in
+            # ``_relayout_city_labels`` can backfill rural views with
+            # actual nearby towns instead of running dry.
+            if pop < 200:
                 continue
             geom = record.geometry
             lon, lat = float(geom.x), float(geom.y)
@@ -151,7 +274,9 @@ def build_overlays(site: Site, *, range_km: float = DEFAULT_RANGE_KM) -> Overlay
                 ring = _project_ring(coords, site)
                 dist = np.hypot(ring[:, 0], ring[:, 1])
                 if (dist < range_km * 1.5).any():
-                    county_rings.append(ring)
+                    county_rings.append(
+                        _simplify_ring_km(ring, _SIMPLIFY_TOL_COUNTY_KM)
+                    )
     except Exception as e:  # noqa: BLE001
         log.warning("Failed to load county borders: %s", e)
 

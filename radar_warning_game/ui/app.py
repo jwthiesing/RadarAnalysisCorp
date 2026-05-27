@@ -224,8 +224,17 @@ class MainWindow(QMainWindow):
         self.session.begin_play()           # peer's session is now PLAYING
         self._prefetcher = Prefetcher(list(cfg.radar_sites), self._cache)
         self._prefetcher.schedule_pregame(cfg.time_start, cfg.time_end)
-        self._prefetch_progress = PrefetchProgressWidget(self._prefetcher)
+        # is_peer=True swaps "Back to radar selection" → "Leave room" and
+        # hides "Start anyway" (peers can't drive the round; they wait
+        # for the host). Empty-sites messaging also reframes to "the
+        # host picked dead radars" since the peer can't fix it locally.
+        self._prefetch_progress = PrefetchProgressWidget(
+            self._prefetcher, is_peer=True,
+        )
         self._prefetch_progress.ready_to_play.connect(self._enter_play)
+        self._prefetch_progress.back_requested.connect(
+            self._on_peer_leave_room
+        )
         self._stack.addWidget(self._prefetch_progress)
         self._stack.setCurrentWidget(self._prefetch_progress)
 
@@ -278,6 +287,7 @@ class MainWindow(QMainWindow):
         self._overview_map = OverviewMap(
             reports=day.reports,
             is_random_day=day.is_random,
+            day=day.convective_day_12z,
         )
         self._overview_map.reroll_requested.connect(self._on_reroll)
         self._overview_map.polygon_changed.connect(self._on_polygon_changed)
@@ -386,9 +396,79 @@ class MainWindow(QMainWindow):
         self._prefetcher.schedule_pregame(time_start, time_end)
         self._prefetch_progress = PrefetchProgressWidget(self._prefetcher)
         self._prefetch_progress.ready_to_play.connect(self._enter_play)
+        self._prefetch_progress.back_requested.connect(
+            self._on_prefetch_back_requested
+        )
         self._stack.addWidget(self._prefetch_progress)
         self._stack.setCurrentWidget(self._prefetch_progress)
         self.statusBar().showMessage("Downloading radar volumes…")
+
+    def _on_peer_leave_room(self) -> None:
+        """Peer clicked 'Leave room' on the prefetch widget — they're
+        either staring at an all-empty prefetch (host picked dead
+        radars) or just don't want to wait. Shut down the prefetcher,
+        disconnect the WebRTC client, and close — the parent app exits
+        cleanly back to the OS / launcher."""
+        if self._prefetch_progress is not None:
+            self._prefetch_progress.stop()
+        if self._prefetcher is not None:
+            try:
+                self._prefetcher.shutdown(wait=False)
+            except Exception:  # noqa: BLE001
+                log.exception("Prefetcher shutdown failed on peer leave")
+            self._prefetcher = None
+        # Disconnect from the host. We don't have a clean
+        # "tell the host we're going" message but the WebRTC
+        # data channel close will trigger PeerLeave on the host side.
+        if self._peer_transport is not None:
+            try:
+                asyncio.ensure_future(self._peer_transport.close())
+            except Exception:  # noqa: BLE001
+                log.exception("Peer transport close failed")
+        self.close()
+
+    def _on_prefetch_back_requested(self) -> None:
+        """Host clicked 'Back to radar selection' on the prefetch widget
+        (typically because the chosen day has no archive data for some
+        or all enabled radars). Discard the half-built prefetcher +
+        round config and pop back to the CONUS overview map so the host
+        can deselect dead sites or re-roll the day."""
+        # Snapshot which sites the prefetcher confirmed have no data
+        # — we'll mark them unavailable on the overview map so the
+        # host can see immediately which ones to deselect.
+        empty_sites: set[str] = set()
+        if self._prefetch_progress is not None:
+            empty_sites = set(self._prefetch_progress._empty_sites)
+            self._prefetch_progress.stop()
+            self._stack.removeWidget(self._prefetch_progress)
+            self._prefetch_progress.deleteLater()
+            self._prefetch_progress = None
+        # Stop the prefetcher cleanly — cancels pending downloads so we
+        # don't keep writing files for a round the host is abandoning.
+        if self._prefetcher is not None:
+            try:
+                self._prefetcher.shutdown(wait=False)
+            except Exception:  # noqa: BLE001
+                log.exception("Prefetcher shutdown failed during back-nav")
+            self._prefetcher = None
+        # Roll the session back from PREFETCH → SETUP so the host's
+        # next "Start round" rebuilds config + prefetcher from scratch.
+        try:
+            self.session.cancel_prefetch()
+        except Exception:  # noqa: BLE001
+            log.warning("Session cancel_prefetch failed; continuing")
+        # Show the overview map again. The map kept its enabled-sites
+        # and polygon state — the host can immediately deselect the
+        # dead sites and try again. Mark the dead sites unavailable so
+        # they render dimmed and refuse re-selection (saves the host
+        # from accidentally picking them again).
+        if self._overview_map is not None:
+            if empty_sites:
+                self._overview_map.mark_sites_unavailable(empty_sites)
+            self._stack.setCurrentWidget(self._overview_map)
+            self.statusBar().showMessage(
+                "Returned to radar selection — adjust enabled radars and try again"
+            )
 
     def _enter_play(self) -> None:
         if self._prefetcher is None or self.session.round_config is None:

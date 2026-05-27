@@ -29,7 +29,6 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QSplitter,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -47,7 +46,7 @@ from .host_map import HostCentralMap
 from .mcd_form import MCDFormDialog
 from .motion_tool import MotionTool
 from .poly_editor import PolygonEditor
-from .radar_panel import RadarPanelGrid
+from .radar_panel import RadarPanelGrid, _TOOL_BUTTON_QSS
 from .warning_form import WarningFormDialog
 
 log = logging.getLogger(__name__)
@@ -95,6 +94,22 @@ class PlayView(QWidget):
         if not sites:
             raise RuntimeError("PlayView needs at least one radar site")
         initial_site = sites[0]
+        # TDWRs are single-pol C-band — Unidata's Level 2 files only carry
+        # REF / VEL / SW (no CC, ZDR, KDP, PHI). Default-laying-out four
+        # panels with two of them dual-pol would leave the host staring
+        # at two permanently-blank panels every render, which reads as
+        # "the panels aren't rendering" even though REF/VEL are fine.
+        # Switch the initial layout to a 2-panel REF/VEL grid when the
+        # initial radar is a TDWR; users can still bump back up to 4
+        # via Alt+4 (panels just won't have dual-pol data to show).
+        from ..data.sites import site_by_icao
+        initial_site_obj = site_by_icao(initial_site)
+        if initial_site_obj is not None and initial_site_obj.is_tdwr:
+            initial_n_panels = 2
+            initial_layout = ("REF", "VEL")
+        else:
+            initial_n_panels = 4
+            initial_layout = None  # default REF/VEL/CC/ZDR
         # Construct without the game-clock cap so the initial display can show
         # the first available sweep even if it's timestamped slightly after the
         # round's nominal start time (NEXRAD scans align to their own schedule,
@@ -103,9 +118,28 @@ class PlayView(QWidget):
         self.radar_grid = RadarPanelGrid(
             sweep_index=prefetcher.sweep_index(initial_site),
             site_icao=initial_site,
-            n_panels=4,
+            n_panels=initial_n_panels,
+            layout=initial_layout,
             max_virtual_time=None,
+            # Surface the full list of radars the host enabled so the
+            # grid's toolbar can show a switcher dropdown. Without
+            # this, the grid is permanently locked to ``initial_site``
+            # — even though the prefetcher has been faithfully
+            # downloading every site's volumes in the background.
+            available_sites=list(sites),
         )
+        # Hand the prefetcher to the grid so its volume-load LRU stays
+        # warm — PyART parse + region-based velocity dealias runs on
+        # the prefetcher's worker pool the moment a download finishes,
+        # which eliminates the 200-3000 ms stall that otherwise hits the
+        # main thread the first time a scrub steps into a new volume.
+        self.radar_grid.attach_prefetcher_preload(prefetcher)
+        # Click an own warning/MCD polygon on any radar panel → opens
+        # the revise dialog. Wired here (not in the grid) so the
+        # multiplayer-or-solo routing of the resulting revision stays
+        # localized to PlayView.
+        self.radar_grid.warning_clicked.connect(self._on_warning_clicked)
+        self.radar_grid.mcd_clicked.connect(self._on_mcd_clicked)
         # Push the game verification polygon onto the radar grid so it's drawn
         # on every panel — players need to see the boundary their warnings
         # must fall within (plan §4a).
@@ -120,15 +154,20 @@ class PlayView(QWidget):
             if initial is not None:
                 self.radar_grid.show_sweep(initial)
 
-        # Host central map — only meaningful in multiplayer where it shows
-        # all players' warnings. In solo the player only has their own
-        # warnings (which they can see directly on the radar panels and the
-        # game-polygon overlay), so the central map is redundant; skip it
-        # and give the radar grid the full width.
+        # Host central map — only created when the local user is the host
+        # of a multiplayer round. It opens as a **separate top-level
+        # window** so the host's play window stays focused on their own
+        # gameplay (radar + their own warnings) instead of seeing every
+        # other player's polygons in real time. Solo and peer clients
+        # never see a host map.
         self._is_solo = multiplayer is None
-        self.host_map: HostCentralMap | None = (
-            None if self._is_solo else HostCentralMap(session)
-        )
+        self._is_host_player = isinstance(multiplayer, MultiplayerHost)
+        self.host_map: HostCentralMap | None = None
+        if self._is_host_player:
+            self.host_map = HostCentralMap(session)
+            self.host_map.setWindowTitle("Host overview — all players")
+            self.host_map.resize(900, 700)
+            self.host_map.show()
 
         # Clock controls (host only — single-player IS the host).
         # On peer clients we still need _on_tick to fire so the map/leaderboard
@@ -167,23 +206,37 @@ class PlayView(QWidget):
         layout.addWidget(self.clock_controls)
         self._action_bar = self._build_action_bar()
         layout.addWidget(self._action_bar)
-        if self.host_map is not None:
-            splitter = QSplitter(Qt.Orientation.Horizontal, self)
-            splitter.addWidget(self.radar_grid)
-            splitter.addWidget(self.host_map)
-            splitter.setSizes([900, 700])
-            layout.addWidget(splitter, stretch=1)
-        else:
-            layout.addWidget(self.radar_grid, stretch=1)
+        # The play window only shows the player's own radar — the host's
+        # all-players overview lives in its own top-level window
+        # (created above when applicable).
+        layout.addWidget(self.radar_grid, stretch=1)
 
         # Keyboard shortcuts — registered at the PlayView level so they fire
         # regardless of which child widget (radar grid, clock bar, host map)
         # currently holds Qt focus. Per-widget keyPressEvent handlers only
         # fire when that widget owns focus, which is unreliable in practice.
-        QShortcut(QKeySequence("N"), self, activated=self._begin_warning_polygon)
-        QShortcut(QKeySequence("C"), self, activated=self._begin_mcd_polygon)
-        QShortcut(QKeySequence("M"), self, activated=self._toggle_motion_tool)
-        QShortcut(QKeySequence("Esc"), self, activated=self._cancel_polygon_draw)
+        # Keep refs on ``self`` so Python's GC can't collect the
+        # QShortcut objects while their parent QWidget is alive. PyQt6
+        # used to keep the connection alive via the parent argument
+        # alone, but observed cases of shortcuts going dead led us to
+        # keep explicit references.
+        self._shortcuts: list[QShortcut] = []
+        def _sc(seq, slot):
+            s = QShortcut(QKeySequence(seq), self, activated=slot)
+            self._shortcuts.append(s)
+            return s
+        _sc("N", self._begin_warning_polygon)
+        _sc("C", self._begin_mcd_polygon)
+        _sc("M", self._toggle_motion_tool)
+        # Polygon-draw finalize/cancel — registered ONCE here at
+        # PlayView level, not per-draw. (The old code re-created the
+        # Return shortcut on every ``_start_polygon_draw`` call which
+        # piled up dangling QShortcut objects and had no Escape
+        # equivalent at all.) The handlers no-op when no polygon is
+        # being drawn, so they're safe to fire from any state.
+        _sc(Qt.Key.Key_Return, self._finish_polygon)
+        _sc(Qt.Key.Key_Enter, self._finish_polygon)    # numeric keypad
+        _sc(Qt.Key.Key_Escape, self._cancel_polygon_draw)
         # Clock controls
         QShortcut(QKeySequence(Qt.Key.Key_Space), self,
                    activated=self.clock_controls._toggle_play)
@@ -259,6 +312,12 @@ class PlayView(QWidget):
         Each button's label includes its keybind. Buttons are focus-skipping
         (NoFocus) so clicking them never traps keyboard input — the global
         QShortcuts continue to work afterward.
+
+        The tool buttons (New Warning / New MCD / Motion) are checkable
+        so the :checked stylesheet kicks in while the corresponding tool
+        is active — a vivid yellow highlight that survives the disabled
+        state (Qt's default :disabled would otherwise mute it back to
+        invisibility).
         """
         bar = QFrame(self)
         bar.setFrameShape(QFrame.Shape.StyledPanel)
@@ -266,27 +325,36 @@ class PlayView(QWidget):
         h.setContentsMargins(6, 4, 6, 4)
         h.setSpacing(6)
 
-        def _btn(label: str, tip: str, slot, *, danger: bool = False) -> QToolButton:
+        def _btn(label, tip, slot, *, danger=False, checkable=False):
             b = QToolButton(bar)
             b.setText(label)
             b.setToolTip(tip)
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setCheckable(checkable)
             if danger:
+                # Danger buttons (Cancel Draw) override the base style
+                # with a red tint instead of the toolbar look.
                 b.setStyleSheet("color: #ff8888;")
+            else:
+                b.setStyleSheet(_TOOL_BUTTON_QSS)
+            # autoExclusive=False so the three tool buttons can't
+            # silently uncheck each other if Qt's radio-group default
+            # ever kicked in.
+            b.setAutoExclusive(False)
             b.clicked.connect(slot)
             return b
 
         self._btn_new_warning = _btn(
             "▲ New Warning  (N)", "Begin a freehand warning polygon",
-            self._begin_warning_polygon,
+            self._begin_warning_polygon, checkable=True,
         )
         self._btn_new_mcd = _btn(
             "◇ New MCD  (C)", "Begin a freehand Mesoscale Convective Discussion",
-            self._begin_mcd_polygon,
+            self._begin_mcd_polygon, checkable=True,
         )
         self._btn_motion = _btn(
             "↗ Motion Tool  (M)", "Two-click storm-motion measurement",
-            self._toggle_motion_tool,
+            self._toggle_motion_tool, checkable=True,
         )
         # Dynamic draw-mode buttons — hidden when no draw is in flight.
         self._btn_finish = _btn(
@@ -311,7 +379,14 @@ class PlayView(QWidget):
         return bar
 
     def _update_action_bar_mode(self, *, drawing: bool) -> None:
-        """Toggle visibility of the Finish/Cancel buttons + hint label."""
+        """Toggle visibility + checked-state of the action-bar buttons.
+
+        While a draw is in flight, the corresponding tool button (warning
+        or MCD) stays *checked* (yellow highlight) AND disabled — so the
+        player can see at a glance which tool produced the in-flight
+        polygon, but can't accidentally start a second one. The other
+        tool buttons go to unchecked + disabled. The Finish/Cancel
+        buttons appear only while drawing."""
         if not hasattr(self, "_btn_finish"):
             return
         self._btn_finish.setVisible(drawing)
@@ -319,6 +394,16 @@ class PlayView(QWidget):
         self._btn_new_warning.setEnabled(not drawing)
         self._btn_new_mcd.setEnabled(not drawing)
         self._btn_motion.setEnabled(not drawing)
+        # Reflect the active tool with the :checked highlight. block-
+        # Signals because we set state programmatically and don't want
+        # the click handler to fire.
+        for b, active in (
+            (self._btn_new_warning, drawing and self._pending_action == "warning"),
+            (self._btn_new_mcd,     drawing and self._pending_action == "mcd"),
+        ):
+            b.blockSignals(True)
+            b.setChecked(active)
+            b.blockSignals(False)
         if drawing and self._pending_action:
             kind = "warning" if self._pending_action == "warning" else "MCD"
             self._draw_hint.setText(
@@ -330,17 +415,29 @@ class PlayView(QWidget):
     # ---- tick handling -------------------------------------------------
 
     def _on_tick(self, tick) -> None:
-        # Update game-clock cap on the radar panel so scrubbing is bounded
+        # Update game-clock cap on the radar panel so scrubbing is bounded.
         self.radar_grid.set_max_virtual_time(tick.virtual_time)
-        # Tell prefetcher to advance its lookahead buffer
+        # Tell prefetcher to advance its lookahead buffer. This now
+        # returns immediately — the actual S3 LIST + dispatch happens
+        # on the prefetcher's dedicated tick worker, so the main
+        # thread is never blocked on network.
         self.prefetcher.advance_clock(tick.virtual_time)
-        # Push reports up to virtual_time onto the radar panel for live overlay
+        # Push reports up to virtual_time onto the radar panel for
+        # live overlay. Route through the setter so its render-key
+        # diff can short-circuit the re-render when the visible
+        # report set is unchanged (the common case — most ticks
+        # don't cross a new report's timestamp).
         if self.session.round_day is not None:
-            visible = [r for r in self.session.round_day.reports if r.time <= tick.virtual_time]
-            self.radar_grid.live_reports = visible
+            visible = [
+                r for r in self.session.round_day.reports
+                if r.time <= tick.virtual_time
+            ]
+            self.radar_grid.set_live_reports(visible)
         # Player's own warnings/MCDs overlaid on each radar panel — drawn for
         # whichever revision is active at the panel's display time, so
-        # scrubbing back shows the polygon as it was then.
+        # scrubbing back shows the polygon as it was then. The setter
+        # diffs against the previously-rendered set, so a tick with no
+        # warning changes (the common case) doesn't trigger a re-render.
         self._push_player_overlays()
         # Refresh the host map (so reports fade + leaderboard updates).
         # In solo there's no host map; the radar panel itself shows reports
@@ -403,7 +500,7 @@ class PlayView(QWidget):
         site = self.radar_grid.site
         from ..geo.projection import xy_km_to_latlon
         self._active_poly_editor = PolygonEditor(
-            panel.ax,
+            panel.view,
             axes_to_latlon=lambda x, y: xy_km_to_latlon(x, y, site.lat, site.lon),
             color=color,
         )
@@ -419,7 +516,9 @@ class PlayView(QWidget):
                 f"Drawing {kind} polygon — click to add vertices, "
                 f"Enter to finish, Esc to cancel"
             )
-        QShortcut(QKeySequence(Qt.Key.Key_Return), self, activated=self._finish_polygon)
+        # Return / Enter / Escape are registered once at PlayView
+        # construction (see ``__init__``); their handlers gate on
+        # ``_active_poly_editor`` so they only act while drawing.
         self._update_action_bar_mode(drawing=True)
 
     def _cancel_polygon_draw(self) -> None:
@@ -496,6 +595,75 @@ class PlayView(QWidget):
                     self.host_map.refresh()
         editor.clear()
 
+    def _on_warning_clicked(self, warning_id: str) -> None:
+        """Open the revise dialog for an own warning the user clicked.
+
+        The dialog opens prefilled from the warning's current revision
+        (type, duration, magnitudes — see ``WarningFormDialog.__init__``'s
+        ``existing=`` branch). On Accept we call ``revise_warning(...)``
+        via the multiplayer wrapper if we're online, or the session
+        directly if we're solo — both append a new revision at the
+        current clock time, broadcast (in MP), and re-render via
+        ``_push_player_overlays``."""
+        # Find the warning in our own bucket. Ignore clicks on other
+        # players' warnings (which currently aren't even drawn on the
+        # radar panel but defensive coding for future relax of that).
+        my_warnings = self.session.warnings_by_player.get(
+            self.local_player_id, [],
+        )
+        target = next(
+            (w for w in my_warnings if w.warning_id == warning_id), None,
+        )
+        if target is None:
+            log.debug("warning click on %s — not in our bucket; ignoring",
+                      warning_id)
+            return
+        # Don't bother opening the dialog for warnings that have already
+        # expired or been canceled — they're frozen and revising them
+        # would just confuse the scoring.
+        ref = (self.session.clock.virtual_time
+               if self.session.clock is not None
+               else target.original_issue_time)
+        if target.canceled_at is not None and ref > target.canceled_at:
+            log.info("warning %s canceled — not opening revise dialog", warning_id)
+            return
+        if ref > target.end_time():
+            log.info("warning %s expired — not opening revise dialog", warning_id)
+            return
+        dlg = WarningFormDialog(existing=target, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        params = dlg.get_parameters()
+        # ``params`` carries warning_type, duration, magnitudes — exactly
+        # the kwargs ``revise_warning`` overlays onto the prior revision
+        # (polygon is preserved by passing None). The reused MP/solo
+        # split mirrors the issue flow in _finish_polygon so the same
+        # routing applies whether we're online or in solo play.
+        if self.multiplayer is not None:
+            asyncio.ensure_future(self.multiplayer.revise_warning(
+                warning_id=warning_id, player_id=self.local_player_id,
+                **params,
+            ))
+        else:
+            w = self.session.revise_warning(
+                warning_id=warning_id, player_id=self.local_player_id,
+                **params,
+            )
+            if self._replay is not None and self.session.clock:
+                self._replay.log_warning_revise(
+                    w, virtual_time=self.session.clock.virtual_time,
+                )
+        self._push_player_overlays()
+        if self.host_map is not None:
+            self.host_map.refresh()
+
+    def _on_mcd_clicked(self, mcd_id: str) -> None:
+        """Stub — MCDs aren't revisable in the current dialog, but we
+        still log clicks so a future ``MCDFormDialog(existing=...)``
+        path can drop in without rewiring the signal."""
+        log.debug("MCD %s clicked — MCD revision not yet supported in UI",
+                  mcd_id)
+
     def _push_player_overlays(self) -> None:
         """Hand the local player's warnings/MCDs to the radar grid so they
         appear immediately after issuance/revision/cancel without waiting
@@ -524,6 +692,14 @@ class PlayView(QWidget):
             self.motion_tool.deactivate()
         else:
             self.motion_tool.activate()
+        # Mirror the new state on the action-bar button so it lights up
+        # while the tool is listening. blockSignals so the click handler
+        # doesn't re-fire from our programmatic setChecked.
+        btn = getattr(self, "_btn_motion", None)
+        if btn is not None:
+            btn.blockSignals(True)
+            btn.setChecked(self.motion_tool.is_active)
+            btn.blockSignals(False)
 
     # ---- shutdown ------------------------------------------------------
 
@@ -531,4 +707,8 @@ class PlayView(QWidget):
         self.clock_controls.stop()
         if self._peer_timer is not None:
             self._peer_timer.stop()
+        # Close the separate host-overview window if we opened one.
+        if self.host_map is not None:
+            self.host_map.close()
+            self.host_map = None
         self.prefetcher.shutdown(wait=False)

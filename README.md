@@ -2,7 +2,7 @@
 
 A Python radar-nowcasting + warning-issuance game inspired by [Reference-Nowcastle/](Reference-Nowcastle/). Single-player or **online P2P multiplayer** (up to 50 players, star topology over WebRTC DataChannels). Play replays of historical severe-weather events, or **LIVE mode** against current weather streaming from IEM.
 
-The player sits at a forecaster's desk: live-feeling radar data streams in from selected WSR-88D sites, storm reports appear as they happen and fade with time, and the player issues **warnings** (SVR / SVRC / SVRD / TOR / TORR / PDS TOR / TORE) and **MCDs** (with SPC-style Peak Intensity Bins) inside a host-defined game polygon. Forecasts are verified against actual storm reports for **POD / FAR / lead-time / magnitude-accuracy** scoring with IBW tier-aware multipliers.
+The player sits at a forecaster's desk: live-feeling radar data streams in from selected radar sites (long-range **WSR-88D** + short-range terminal **TDWR**), storm reports appear as they happen and fade with time, and the player issues **warnings** (SVR / SVRC / SVRD / TOR / TORR / PDS TOR / TORE) and **MCDs** (with SPC-style Peak Intensity Bins) inside a host-defined game polygon. Forecasts are verified against actual storm reports for **POD / FAR / lead-time / magnitude-accuracy** scoring with IBW tier-aware multipliers.
 
 ---
 
@@ -19,14 +19,15 @@ python -m radar_warning_game.play
 ```
 
 Dependencies installed automatically:
-- **PyQt6** + **qasync** — GUI + Qt/asyncio bridge
+- **PyQt6** + **qasync** — GUI + Qt/asyncio bridge (one event loop drives both)
+- **pyqtgraph** — high-performance 2D plotting (`ImageItem` for the radar polar shader, `PlotCurveItem` for vector overlays, `ScatterPlotItem` for reports, `TextItem` for labels)
 - **PyART (`arm_pyart`)** — NEXRAD Level 2 parsing + velocity dealiasing
-- **matplotlib + cartopy** — basemaps, radar rendering, county overlays
+- **matplotlib** — only used for its colormap registry (pyart's `ChaseSpectral`, `Carbone42`, …) which pyqtgraph reads through its matplotlib bridge
+- **cartopy** — Natural Earth shapefile loader (states, country borders, coastlines, populated places). No cartopy projection or matplotlib axes are used at render time; we project to lon/lat (maps) or km-from-radar (panels) up front
 - **boto3** — radar S3 access (unsigned; no AWS account needed)
 - **requests** — IEM LSR fetch + live-mirror radar download
 - **aiortc + aiohttp** — WebRTC DataChannels + signaling
-- **shapely** — polygon math (5 km buffer, point-in-polygon, union)
-- **mpl_point_clicker** — interactive polygon vertex placement
+- **numpy** + **pandas** + **shapely** — array math (rasterizer + lookup tables), LSR CSV parsing, polygon math (5 km buffer, point-in-polygon, union)
 
 ---
 
@@ -46,7 +47,9 @@ In the **Day Picker** you choose one of three modes:
 
 On the **CONUS overview** screen, click **`Draw polygon`** to enter polygon-drawing mode (cursor changes to a crosshair and the button turns bright yellow). Outside draw mode the map behaves like Google Maps — see [Map controls](#map-controls) below.
 
-The host clicks **WSR-88D X markers** to enable (cyan) or disable (grey) each radar for the round. Inactive radars are unavailable to all players, simulating downed radars.
+The host clicks **radar-site markers** to enable (cyan) or disable each radar for the round. **WSR-88Ds** are drawn as X's, **TDWRs** as smaller circles in lavender — the same toggle gesture applies to both. Inactive radars are unavailable to all players, simulating downed radars. A background thread probes the Unidata Level 2 archive for each site on the chosen day; sites with no coverage for that date are dimmed and refuse selection. TDWR archive coverage on the Unidata mirror is patchy in older years, so for pre-2010ish events the TDWR fleet will mostly grey out — but for modern events you can grab a TDWR for inner-city tornado scenarios where its sub-1°-elevation low scans see things the WSR-88D's beam overshoots.
+
+When the initial radar of a round is a TDWR, the play view opens in a 2-panel **REF / VEL** layout by default (Alt+1 / Alt+2 / Alt+4 still toggle). TDWR Level 2 from Unidata only carries REF, VEL, and SW — there is no CC / ZDR / KDP / PHI, so the default 4-panel REF/VEL/CC/ZDR layout would leave the dual-pol panels permanently blank.
 
 After the polygon is drawn, the host's status bar shows `polygon set` and the **`Continue to time window →`** button advances to the time histogram. In historical mode the host drags a span over the day's storm-report distribution to pick the game window. **`Start round →`** kicks off radar prefetch. Once the radar data lands, the **PlayView** opens.
 
@@ -134,8 +137,13 @@ Drawn on every panel:
   - ● **green-edged circle** = hail
   - ■ **blue-edged square** = wind
   - Fill color: time-of-day colormap; size: magnitude.
+- **Your own warning polygons** — colored by tier-family and weighted by tier:
+  - **Yellow dashed** = SVR / SVRC / SVRD (weight grows with tier)
+  - **Red solid** = TOR / TORR
+  - **Pink solid** = PDS TOR
+  - **TORE** is drawn as a *double-stroked* polygon — a wide pink halo with a thinner black core line on top — so the most-significant tier reads at a glance against any radar background.
 
-The host-only **Central Map** (multiplayer) additionally shows every player's warning polygons colored by team. **In single-player the central map is hidden** since you only have your own warnings — the radar panels themselves show everything you need.
+The host-only **Central Map** (multiplayer) additionally shows every player's warning polygons colored by team. On that map TORE keeps the team color as its outer halo with a black inner stroke. **In single-player the central map is hidden** since you only have your own warnings — the radar panels themselves show everything you need.
 
 ---
 
@@ -166,7 +174,7 @@ POD denominator uses the game polygon with the same 5 km verification buffer, so
 - **Per-hazard PIB accuracy** (closer to observed = better; observed PIB 0 + predicted None = small credit)
 - **Per-hazard lead-time bonus** — separate lead for tornado / wind / hail, averaged. A predicted-but-unverified hazard contributes 0 to the average.
 - **Multi-hazard breadth bonus** when 2+ predicted hazards verify
-- **Anti-spam (server-side enforced):** min 200 km² area, min 4 vertices, max 50 % game-polygon coverage, max 1 active MCD per team per 30 game-minutes. Wire MCDs from peers are validated too, not just dialog-side.
+- **Anti-spam (server-side enforced):** min 200 km² area, max 250 000 km² area (absolute cap — roughly a large real-world SPC MCD covering 4-5 states), min 4 vertices, max 1 active MCD per team per 30 game-minutes. Wire MCDs from peers are validated too, not just dialog-side.
 
 **Team mode** (host-optional) lets players form teams in a pre-round lobby. Each team is scored as one entity — the union of teammates' warnings.
 
@@ -217,17 +225,39 @@ Peer clients in live mode run a local 1 Hz timer that drives the in-game tick �
 
 ## Performance
 
-The radar grid is optimized for smooth scrubbing through hundreds of NEXRAD volumes:
+The radar grid is optimized for smooth scrubbing through hundreds of NEXRAD volumes and smooth pan/zoom across the synced panels:
 
-- **Configurable radar LRU cache** keeps recent PyART `Radar` objects in memory (default 24, min 6, max 100 via the `radar_lru_size` constructor kwarg). Scrubbing back to a recently-viewed volume is ~12× faster than re-parsing the Level 2 file.
-- **`LineCollection`** for state / county / range-ring borders instead of N separate `Line2D` artists — much cheaper matplotlib draw path.
-- **Batched scatter** for city dots (single call vs N scatter calls).
-- **Greedy non-overlap city labeling** — sort by population descending, skip overlapping labels via fast pixel-bbox comparison. Replaces the previous adjustText-based approach which iterated per render and was the main scrub bottleneck.
-- **Rasterized `pcolormesh`** — the heavy 1.3M-cell radar mesh is treated as a raster image during draw rather than a vector path.
-- **Debounced repaints** during continuous pan/zoom — a 40 ms QTimer coalesces rapid scroll/drag events into one repaint per panel.
-- **View preservation across data changes** — `set_xlim`/`set_ylim` are saved and restored across `pcolormesh` calls so scrubbing time doesn't blow away your zoom.
+- **Polar shader (CPU).** The sweep is rasterized from polar (azimuth, range) → Cartesian (km east/north) via vectorized numpy ufuncs and displayed as a single `pg.ImageItem`. For each output pixel we look up the `(ray, range_bin)` it samples, fetch the cell value, and run the colormap — that's the polar shader; it just lives on the CPU as numpy gather + LUT, not as GLSL on a GPU.
+- **Parallel rasterize across panels.** Each panel's polar shader runs on its own worker thread from a shared `ThreadPoolExecutor(max_workers=4)`. numpy releases the GIL for the gather + clip + take ops inside `_rasterize_polar`, so a 4-panel grid's 4 × 15 ms serial cost collapses to ~15-20 ms wall-clock. The grid does a three-phase render — main-thread prepare (warm caches, slice sweep data), worker-thread rasterize (parallel), main-thread commit (`setImage` + overlays).
+- **1024² image at 1.5× padding.** The rasterizer always renders at `RADAR_IMAGE_SIZE_PX = 1024` (chosen to match the per-panel pixel count on typical displays without leaving Qt's raster engine in slow paths) into an image rect that is **1.5× the visible view in each direction**. Small pans within that headroom hit the same chosen rect → no re-rasterize fires → pan is essentially a scene-transform update.
+- **Snap-to-discrete-extent zoom.** The view rect is rounded *up* to one of six discrete extent levels (20 / 40 / 80 / 120 / 160 / 250 km half-width) and its center snapped to a coarse grid (`half / 2`). The cache reuses lookup tables across many sweeps at the same zoom level.
+- **Cached per-pixel polar lookup.** The `(ray_idx, bin_idx, valid)` table is built once per `(extent_rect, polar_signature)` and cached as an `OrderedDict` (max 16 entries). A fresh sweep at the same VCP/tilt and zoom level skips the trigonometry entirely; only the colormap + image upload runs. The lookup + LUT caches are pre-warmed on the main thread before the worker fan-out so concurrent panels never race on cache writes.
+- **256-entry colormap LUT** (one `np.take` instead of four `np.interp` calls) — ~10× faster per render than going through pyqtgraph's `ColorMap.map` directly.
+- **Cached static overlays across sweep changes.** Range rings, state borders, county borders, and city dots/labels persist across time-scrubs — `_draw_overlays` is keyed on the overlay bundle's `id()` and no-ops when the bundle is unchanged. Only the *dynamic* overlay layer (game polygon, warnings, MCDs, live reports) gets torn down and rebuilt per render. Saves ~10–20 ms per scrub tick before the rasterize even runs.
+- **Geometry simplification at load time.** State and county rings get Douglas-Peucker-simplified (`shapely.simplify`, tolerance 0.2 km for states / 0.1 km for counties) when the overlay bundle is built. State borders collapse from ~10k total vertices to ~500, counties from ~80k to ~18k — drops `QPainter.drawPath` time per paint and shrinks the per-frame concat buffer used by the bbox cull.
+- **View-culled state / county borders.** Each border ring is bbox-tested against the current view rect; only rings that actually intersect the visible area are concatenated into the `PlotCurveItem` data. Drops per-panel pan cost further at high zoom.
+- **Greedy non-overlap city labels** with off-screen culling.
+- **Configurable radar LRU cache** keeps recent PyART `Radar` objects in memory (default 24, min 6, max 100 via the `radar_lru_size` constructor kwarg).
+- **Background pre-load + pre-dealias.** As soon as the prefetcher finishes downloading a Level 2 volume, a 2-worker `ThreadPoolExecutor` runs `pyart.io.read_nexrad_archive` and `dealias_region_based` on it and stashes the result in a shared preload cache. The grid checks that cache before falling back to a synchronous parse — turning the per-volume-crossing main-thread stall from **~1.9 seconds** (270 ms read + 1600 ms region-based dealias on a busy WSR-88D volume) into a **~1 μs** dict lookup. This is the single biggest perceived-latency win for time-bar scrubbing through multi-volume rounds.
+- **Async + throttled lookahead refill.** `prefetcher.advance_clock` is called once per game-clock tick (1 Hz) but the actual S3 ListObjectsV2 + download enqueue runs on a dedicated single-worker tick pool — the main thread returns immediately. A 15-second game-time throttle further short-circuits redundant relists (the lookahead window is 20 min, so polling every second was overkill). Drops the per-tick main-thread cost from ~100-500 ms (synchronous S3 LIST per enabled radar) to ~10 μs.
+- **Render-key diffs in tick setters.** `set_player_warnings`, `set_live_reports`, and `set_game_polygon` short-circuit when the input set's identity-and-revision signature matches the last render. The game tick fires every second whether the player has issued a warning or not — without the diff the radar grid was re-rasterizing all four panels on every tick (~16 ms × 4 = 60 ms wasted per idle tick). Now only ticks that actually change visible state pay the rerender.
+- **Scrub debouncing.** Rapid ←/→/↑/↓ keypresses (and slider drags) update the logical position synchronously but coalesce into a single render via a 15 ms QTimer — short enough to feel instantaneous on a single keystroke while still folding keyboard auto-repeat (~30-60 ms) into one render.
+- **View-change debouncing — two-layer.** Pan/zoom drags update the radar's pending view rect but coalesce into one re-rasterize after 40 ms of idle. A separate 40 ms timer batches the *overlay* work (border-ring bbox cull, city-label relayout) so the dozens-per-second `sigRangeChanged` ticks during a drag don't re-walk thousands of ring AABBs each frame.
+- **Origin-skip broadcast.** When one panel pans/zooms, the grid mirrors the limits to all *other* panels but skips the originator (whose view is already correct) — avoids a redundant `setRange` round-trip and the second `sigRangeChanged` it would fire on the source panel.
+- **Hidden axes fully unlinked.** `hideAxis()` alone leaves the AxisItem listening to `sigXRangeChanged` and recomputing its (invisible) HTML label every tick. We disconnect the link in `RadarPanel.__init__` so hidden axes are truly inert during pan.
 
-Measured: **305 ms → 124 ms per scrub** with 4 panels rendering simultaneously, after greedy non-overlap + off-screen culling.
+Measured (M-class laptop, super-res NEXRAD 720 × 1832 = 1.3 M cells, Qt offscreen):
+
+| Operation | Latency |
+|---|---|
+| Warm-cache rasterize, 1 panel | **~15 ms** (1024², lookup-table hit) |
+| Cold-cache rasterize, 1 panel | ~50–70 ms (lookup-table build) |
+| **Time-bar scrub, 4-panel grid (parallel)** | **~16 ms / frame** (~60 fps, 100% of frames <33 ms) |
+| Volume-crossing scrub stall (WSR-88D, region-based dealias) | **~0 ms** with preload (vs ~1900 ms cold-cache) |
+| Game tick on main thread, solo (idle, 4-panel grid) | **~0.9 ms / tick** (vs ~100-500 ms before — S3 LIST + always-rerender) |
+| Pan / zoom frame, 4-panel grid (synced) | **~2 ms / frame** (>400 fps headroom, 100% of frames <16 ms) |
+| Mouse-drag pan (120 consecutive frames) | **~2 ms / frame** (max 2.5 ms, 0 frames >16 ms) |
+| Cold-cache zoom-level snap change | one-time ~50–70 ms per new snap rect |
 
 ---
 
@@ -300,7 +330,7 @@ radar_warning_game/
 signaling_server/
 └── server.py               # aiohttp WebSocket server for room codes + SDP exchange
 
-tests/                      # 253 pytest tests across 20 files
+tests/                      # 261 pytest tests across 20 files
 ```
 
 ---
@@ -312,7 +342,7 @@ pip install -e ".[dev]"
 python -m pytest tests/ -q
 ```
 
-253 tests covering: SAILS sweep index, 5-km buffered point-in-polygon, scoring metrics (incl. team aggregation, magnitude revisions, per-revision tier), tier multipliers, MCD PIB scoring and anti-spam, protocol round-trip, multiplayer state appliers, date-blinding scrape, casualty regex, cache, clock, session state machine, replay, event reveal, colors, sites, live source, round builder. Runs in ~2 seconds.
+261 tests covering: SAILS sweep index, 5-km buffered point-in-polygon, scoring metrics (incl. team aggregation, magnitude revisions, per-revision tier), tier multipliers, MCD PIB scoring and anti-spam, protocol round-trip, multiplayer state appliers, date-blinding scrape, casualty regex, cache, clock, session state machine, replay, event reveal, colors, sites, live source, round builder. Runs in ~2 seconds.
 
 GitHub Actions CI at [`.github/workflows/test.yml`](.github/workflows/test.yml) runs the suite on Python 3.11 and 3.12 with Qt offscreen + cartopy system deps.
 
@@ -325,7 +355,7 @@ GitHub Actions CI at [`.github/workflows/test.yml`](.github/workflows/test.yml) 
 - **Late-warn POD credit** is allowed only for TORR (10-minute window)
 - **Replay playback** UI not implemented; replay JSON files are written but only readable by tooling
 - **SPC final-EF backfill** is best-effort; SPC's daily filtered CSV has a messy multi-section format that defeats naive `pd.read_csv` and we fall back to IEM preliminary data when matching fails
-- **Single-radar focus per panel** during play; site switching requires re-running the setup
+- **All four panels show the same radar at a time.** Switching between enabled radars uses the **Radar:** dropdown in the toolbar (appears when the host enabled more than one site). Each site's volumes are downloaded + indexed independently in the background, so switching is instant once the new site has at least one volume cached; otherwise the panels show a "no sweep selected" placeholder until the new site's first volume lands.
 - **Town labels** beyond major cities not wired (counties drawn but unlabeled)
 - **`adjustText`** is no longer installed/used; some city labels may overlap at certain zoom levels (the greedy non-overlap algorithm hides smaller cities to compensate)
 

@@ -7,6 +7,7 @@ AWS credentials are needed. Files there are gzipped (``.gz`` suffix); PyART's
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,8 @@ from botocore import UNSIGNED
 from botocore.config import Config
 
 from .cache import HashedCache
+
+log = logging.getLogger(__name__)
 
 BUCKET = "unidata-nexrad-level2"
 
@@ -68,6 +71,51 @@ def list_volumes_for_day(site: str, day: datetime) -> list[ScanRef]:
             out.append(ScanRef(site=site, time=t, key=k))
     out.sort(key=lambda r: r.time)
     return out
+
+
+# Result cache for site-day archive probes. Keyed by ``(site, YYYY-MM-DD)``
+# so a probe per site per day pays one S3 round-trip; subsequent calls
+# (same site/day) read from memory. The cache is small — typical setup
+# probes ~200 sites for one day = ~200 entries — so we don't bother
+# evicting.
+_AVAILABILITY_CACHE: dict[tuple[str, str], bool] = {}
+
+
+def site_has_data_on_day(site: str, day: datetime) -> bool:
+    """Return ``True`` iff the Unidata mirror has at least one Level 2
+    volume for ``site`` on the UTC calendar day of ``day``.
+
+    Used by the radar-selection map to grey out sites whose archive
+    coverage is missing for a chosen historical day — TDWR coverage on
+    the Unidata mirror in particular is patchy in older years and we
+    don't want a player picking a TDWR that will yield empty radar
+    panels at round start.
+
+    Implementation note: we use ``ListObjectsV2`` with ``MaxKeys=1`` to
+    pay the smallest possible S3 round-trip — we only need to know
+    whether *any* key exists under the prefix. Result is memoized per
+    ``(site, day)``."""
+    site = site.upper()
+    if day.tzinfo is None:
+        day = day.replace(tzinfo=timezone.utc)
+    key = (site, day.strftime("%Y-%m-%d"))
+    cached = _AVAILABILITY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    prefix = f"{day:%Y/%m/%d}/{site}/"
+    try:
+        resp = s3_client().list_objects_v2(
+            Bucket=BUCKET, Prefix=prefix, MaxKeys=1,
+        )
+        has_any = (resp.get("KeyCount") or 0) > 0
+    except Exception as e:  # noqa: BLE001
+        # Network blip / transient — fall back to "available" so the
+        # site isn't punished for a probe error. The real prefetch will
+        # surface any data-missing condition at round start.
+        log.warning("archive probe failed for %s on %s: %s", site, key[1], e)
+        has_any = True
+    _AVAILABILITY_CACHE[key] = has_any
+    return has_any
 
 
 def list_volumes_in_window(site: str, start: datetime, end: datetime) -> list[ScanRef]:
