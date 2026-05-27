@@ -27,7 +27,10 @@ from PyQt6.QtWidgets import (
     QDialog,
     QFrame,
     QHBoxLayout,
+    QLabel,
+    QPushButton,
     QSplitter,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -103,6 +106,11 @@ class PlayView(QWidget):
             n_panels=4,
             max_virtual_time=None,
         )
+        # Push the game verification polygon onto the radar grid so it's drawn
+        # on every panel — players need to see the boundary their warnings
+        # must fall within (plan §4a).
+        if session.round_config is not None:
+            self.radar_grid.set_game_polygon(session.round_config.game_polygon)
         if session.clock:
             si = self.radar_grid.sweep_index
             initial = si.latest_at_or_before(session.clock.virtual_time, elev_deg=0.5)
@@ -112,8 +120,15 @@ class PlayView(QWidget):
             if initial is not None:
                 self.radar_grid.show_sweep(initial)
 
-        # Host central map
-        self.host_map = HostCentralMap(session)
+        # Host central map — only meaningful in multiplayer where it shows
+        # all players' warnings. In solo the player only has their own
+        # warnings (which they can see directly on the radar panels and the
+        # game-polygon overlay), so the central map is redundant; skip it
+        # and give the radar grid the full width.
+        self._is_solo = multiplayer is None
+        self.host_map: HostCentralMap | None = (
+            None if self._is_solo else HostCentralMap(session)
+        )
 
         # Clock controls (host only — single-player IS the host).
         # On peer clients we still need _on_tick to fire so the map/leaderboard
@@ -134,30 +149,183 @@ class PlayView(QWidget):
             self._peer_timer.timeout.connect(self._peer_local_tick)
             self._peer_timer.start()
 
-        # Motion tool (lazy-attached)
+        # Motion tool (lazy-attached). Tracks persist across activate/
+        # deactivate cycles; right-click removes a single track at any time.
         self.motion_tool = MotionTool(self.radar_grid)
+        # When the panel layout changes (Alt+1/2/4), the old canvases die
+        # and any storm-track artists go with them. Tell the tool to drop
+        # stale state and re-attach to the new canvases.
+        self.radar_grid.panels_rebuilt.connect(
+            self.motion_tool.reinstall_handlers_for_new_panels
+        )
 
-        # Layout: clock at top; splitter with radar | host_map
-        splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        splitter.addWidget(self.radar_grid)
-        splitter.addWidget(self.host_map)
-        splitter.setSizes([900, 700])
-
+        # Layout: clock at top; action bar below it; radar grid fills the
+        # rest. The action bar gives every keybind a discoverable button
+        # equivalent — players don't have to memorize the key chart.
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.addWidget(self.clock_controls)
-        layout.addWidget(splitter, stretch=1)
+        self._action_bar = self._build_action_bar()
+        layout.addWidget(self._action_bar)
+        if self.host_map is not None:
+            splitter = QSplitter(Qt.Orientation.Horizontal, self)
+            splitter.addWidget(self.radar_grid)
+            splitter.addWidget(self.host_map)
+            splitter.setSizes([900, 700])
+            layout.addWidget(splitter, stretch=1)
+        else:
+            layout.addWidget(self.radar_grid, stretch=1)
 
-        # Keyboard shortcuts
+        # Keyboard shortcuts — registered at the PlayView level so they fire
+        # regardless of which child widget (radar grid, clock bar, host map)
+        # currently holds Qt focus. Per-widget keyPressEvent handlers only
+        # fire when that widget owns focus, which is unreliable in practice.
         QShortcut(QKeySequence("N"), self, activated=self._begin_warning_polygon)
         QShortcut(QKeySequence("C"), self, activated=self._begin_mcd_polygon)
         QShortcut(QKeySequence("M"), self, activated=self._toggle_motion_tool)
         QShortcut(QKeySequence("Esc"), self, activated=self._cancel_polygon_draw)
+        # Clock controls
+        QShortcut(QKeySequence(Qt.Key.Key_Space), self,
+                   activated=self.clock_controls._toggle_play)
+        QShortcut(QKeySequence(Qt.Key.Key_BracketLeft), self,
+                   activated=self.clock_controls._slower)
+        QShortcut(QKeySequence(Qt.Key.Key_BracketRight), self,
+                   activated=self.clock_controls._faster)
+        # Radar scrub: arrow keys + Shift modifiers
+        QShortcut(QKeySequence(Qt.Key.Key_Left), self,
+                   activated=lambda: self.radar_grid.step_time(-1))
+        QShortcut(QKeySequence(Qt.Key.Key_Right), self,
+                   activated=lambda: self.radar_grid.step_time(+1))
+        QShortcut(QKeySequence("Shift+Left"), self,
+                   activated=lambda: self.radar_grid.step_time(-5))
+        QShortcut(QKeySequence("Shift+Right"), self,
+                   activated=lambda: self.radar_grid.step_time(+5))
+        QShortcut(QKeySequence(Qt.Key.Key_Up), self,
+                   activated=lambda: self.radar_grid.step_elevation(+1))
+        QShortcut(QKeySequence(Qt.Key.Key_Down), self,
+                   activated=lambda: self.radar_grid.step_elevation(-1))
+        # Panel-count selectors. Alt+digit because plain digits cycle products
+        # on the focused panel.
+        QShortcut(QKeySequence("Alt+1"), self,
+                   activated=lambda: self.radar_grid.set_layout(1))
+        QShortcut(QKeySequence("Alt+2"), self,
+                   activated=lambda: self.radar_grid.set_layout(2))
+        QShortcut(QKeySequence("Alt+4"), self,
+                   activated=lambda: self.radar_grid.set_layout(4))
+        # Product cycling on the focused panel — same key-to-product map as
+        # PRODUCTS dict ordering: 1=REF, 2=VEL, 3=SW, 4=CC, 5=ZDR, 6=KDP, 7=PHI.
+        # Click a panel to focus it before pressing the digit.
+        for i, key in enumerate(("1", "2", "3", "4", "5", "6", "7")):
+            QShortcut(QKeySequence(key), self,
+                       activated=lambda idx=i: self.radar_grid._cycle_focused_product(idx))
+        # Keyboard zoom (center-of-view). Scroll-wheel zoom still works but
+        # these give precise stepwise zoom that doesn't depend on cursor position.
+        QShortcut(QKeySequence("="), self,
+                   activated=lambda: self.radar_grid.zoom(0.8))  # zoom in
+        QShortcut(QKeySequence("-"), self,
+                   activated=lambda: self.radar_grid.zoom(1.25))  # zoom out
+        # Plus key without shift on some layouts; treat it the same as =
+        QShortcut(QKeySequence("+"), self,
+                   activated=lambda: self.radar_grid.zoom(0.8))
+        # Data inspector toggle — mousing over the radar reveals the
+        # displayed product's value at the cursor location while on.
+        QShortcut(QKeySequence("I"), self,
+                   activated=lambda: self._toggle_inspector())
+        # WASD pan — each step shifts the view by 20% of its current size.
+        # Mirrors the mouse-drag pan but is keyboard-only so the player can
+        # nudge the view without leaving the focused panel.
+        PAN_STEP = 0.2
+        QShortcut(QKeySequence("W"), self,
+                   activated=lambda: self.radar_grid.pan(0.0, +PAN_STEP))
+        QShortcut(QKeySequence("S"), self,
+                   activated=lambda: self.radar_grid.pan(0.0, -PAN_STEP))
+        QShortcut(QKeySequence("A"), self,
+                   activated=lambda: self.radar_grid.pan(-PAN_STEP, 0.0))
+        QShortcut(QKeySequence("D"), self,
+                   activated=lambda: self.radar_grid.pan(+PAN_STEP, 0.0))
 
         # In-flight polygon editor (set during a draw)
         self._active_poly_editor: PolygonEditor | None = None
         self._pending_action: str | None = None     # 'warning' or 'mcd'
         self._original_cursor = None
+        # Action bar starts in idle mode (Finish/Cancel hidden until draw starts)
+        self._update_action_bar_mode(drawing=False)
+
+    # ---- action bar ----------------------------------------------------
+
+    def _build_action_bar(self) -> QFrame:
+        """Buttons for every PlayView-level keybind: N/C/M/Esc/Enter.
+
+        Each button's label includes its keybind. Buttons are focus-skipping
+        (NoFocus) so clicking them never traps keyboard input — the global
+        QShortcuts continue to work afterward.
+        """
+        bar = QFrame(self)
+        bar.setFrameShape(QFrame.Shape.StyledPanel)
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(6, 4, 6, 4)
+        h.setSpacing(6)
+
+        def _btn(label: str, tip: str, slot, *, danger: bool = False) -> QToolButton:
+            b = QToolButton(bar)
+            b.setText(label)
+            b.setToolTip(tip)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            if danger:
+                b.setStyleSheet("color: #ff8888;")
+            b.clicked.connect(slot)
+            return b
+
+        self._btn_new_warning = _btn(
+            "▲ New Warning  (N)", "Begin a freehand warning polygon",
+            self._begin_warning_polygon,
+        )
+        self._btn_new_mcd = _btn(
+            "◇ New MCD  (C)", "Begin a freehand Mesoscale Convective Discussion",
+            self._begin_mcd_polygon,
+        )
+        self._btn_motion = _btn(
+            "↗ Motion Tool  (M)", "Two-click storm-motion measurement",
+            self._toggle_motion_tool,
+        )
+        # Dynamic draw-mode buttons — hidden when no draw is in flight.
+        self._btn_finish = _btn(
+            "✓ Finish Polygon  (Enter)",
+            "Close and submit the in-flight polygon",
+            self._finish_polygon,
+        )
+        self._btn_cancel = _btn(
+            "✗ Cancel Draw  (Esc)",
+            "Discard the in-flight polygon",
+            self._cancel_polygon_draw,
+            danger=True,
+        )
+
+        for b in (self._btn_new_warning, self._btn_new_mcd, self._btn_motion,
+                  self._btn_finish, self._btn_cancel):
+            h.addWidget(b)
+        h.addStretch(1)
+        self._draw_hint = QLabel("", bar)
+        self._draw_hint.setStyleSheet("color: #ffd400; font-weight: bold;")
+        h.addWidget(self._draw_hint)
+        return bar
+
+    def _update_action_bar_mode(self, *, drawing: bool) -> None:
+        """Toggle visibility of the Finish/Cancel buttons + hint label."""
+        if not hasattr(self, "_btn_finish"):
+            return
+        self._btn_finish.setVisible(drawing)
+        self._btn_cancel.setVisible(drawing)
+        self._btn_new_warning.setEnabled(not drawing)
+        self._btn_new_mcd.setEnabled(not drawing)
+        self._btn_motion.setEnabled(not drawing)
+        if drawing and self._pending_action:
+            kind = "warning" if self._pending_action == "warning" else "MCD"
+            self._draw_hint.setText(
+                f"Drawing {kind} polygon — click to add vertices"
+            )
+        else:
+            self._draw_hint.setText("")
 
     # ---- tick handling -------------------------------------------------
 
@@ -170,8 +338,15 @@ class PlayView(QWidget):
         if self.session.round_day is not None:
             visible = [r for r in self.session.round_day.reports if r.time <= tick.virtual_time]
             self.radar_grid.live_reports = visible
-        # Refresh the host map (so reports fade + leaderboard updates)
-        self.host_map.refresh()
+        # Player's own warnings/MCDs overlaid on each radar panel — drawn for
+        # whichever revision is active at the panel's display time, so
+        # scrubbing back shows the polygon as it was then.
+        self._push_player_overlays()
+        # Refresh the host map (so reports fade + leaderboard updates).
+        # In solo there's no host map; the radar panel itself shows reports
+        # via the live-reports overlay we just updated.
+        if self.host_map is not None:
+            self.host_map.refresh()
         # Broadcast the tick to peers (host only)
         if isinstance(self.multiplayer, MultiplayerHost):
             asyncio.ensure_future(self.multiplayer.broadcast_tick(tick))
@@ -245,6 +420,7 @@ class PlayView(QWidget):
                 f"Enter to finish, Esc to cancel"
             )
         QShortcut(QKeySequence(Qt.Key.Key_Return), self, activated=self._finish_polygon)
+        self._update_action_bar_mode(drawing=True)
 
     def _cancel_polygon_draw(self) -> None:
         """Esc handler — clear in-flight polygon and reset the cursor / status."""
@@ -254,6 +430,7 @@ class PlayView(QWidget):
         self._active_poly_editor = None
         self._pending_action = None
         self._restore_default_cursor()
+        self._update_action_bar_mode(drawing=False)
         parent = self.window()
         if hasattr(parent, "statusBar"):
             parent.statusBar().showMessage("Draw canceled", 2000)
@@ -274,6 +451,7 @@ class PlayView(QWidget):
         self._active_poly_editor = None
         self._pending_action = None
         self._restore_default_cursor()
+        self._update_action_bar_mode(drawing=False)
         if polygon is None:
             log.info("Polygon has < 3 vertices; canceled")
             editor.clear()
@@ -296,7 +474,9 @@ class PlayView(QWidget):
                     )
                     if self._replay is not None and self.session.clock:
                         self._replay.log_warning_issue(w, virtual_time=self.session.clock.virtual_time)
-                self.host_map.refresh()
+                self._push_player_overlays()
+                if self.host_map is not None:
+                    self.host_map.refresh()
         elif action == "mcd":
             dlg = MCDFormDialog(parent=self)
             if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -311,13 +491,37 @@ class PlayView(QWidget):
                     )
                     if self._replay is not None and self.session.clock:
                         self._replay.log_mcd_issue(m, virtual_time=self.session.clock.virtual_time)
-                self.host_map.refresh()
+                self._push_player_overlays()
+                if self.host_map is not None:
+                    self.host_map.refresh()
         editor.clear()
+
+    def _push_player_overlays(self) -> None:
+        """Hand the local player's warnings/MCDs to the radar grid so they
+        appear immediately after issuance/revision/cancel without waiting
+        for the next tick. Filtering to revisions-active-at-display-time
+        happens inside the grid's draw routine.
+        """
+        self.radar_grid.set_player_warnings(
+            self.session.warnings_by_player.get(self.local_player_id, []),
+            self.session.mcds_by_player.get(self.local_player_id, []),
+        )
+
+    def _toggle_inspector(self) -> None:
+        """Keybind-driven inspector toggle. Reflects the new state back on
+        the toolbar's checkable button so the UI stays in sync."""
+        new_state = self.radar_grid.toggle_inspector()
+        btn = getattr(self.radar_grid, "_inspector_btn", None)
+        if btn is not None:
+            btn.blockSignals(True)
+            btn.setChecked(new_state)
+            btn.blockSignals(False)
 
     def _toggle_motion_tool(self) -> None:
         if self.motion_tool.is_active:
+            # Stop listening for new clicks; existing tracks remain drawn
+            # until the player right-clicks them.
             self.motion_tool.deactivate()
-            self.motion_tool.reset()
         else:
             self.motion_tool.activate()
 

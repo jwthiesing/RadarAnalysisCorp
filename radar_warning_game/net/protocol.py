@@ -114,6 +114,7 @@ class WarningIssue:
     hail_in: float | None = None
     wind_mph: float | None = None
     ef: float | None = None
+    tornado_possible: bool = False
     type: str = "WarningIssue"
 
 
@@ -129,6 +130,7 @@ class WarningRevise:
     hail_in: float | None = None
     wind_mph: float | None = None
     ef: float | None = None
+    tornado_possible: bool = False
     type: str = "WarningRevise"
 
 
@@ -214,6 +216,7 @@ def warning_issue_from(warning, round_epoch: datetime) -> WarningIssue:
         hail_in=cur.magnitudes.hail_in,
         wind_mph=cur.magnitudes.wind_mph,
         ef=cur.magnitudes.ef,
+        tornado_possible=cur.magnitudes.tornado_possible,
     )
 
 
@@ -229,6 +232,7 @@ def warning_revise_from(warning, round_epoch: datetime) -> WarningRevise:
         hail_in=cur.magnitudes.hail_in,
         wind_mph=cur.magnitudes.wind_mph,
         ef=cur.magnitudes.ef,
+        tornado_possible=cur.magnitudes.tornado_possible,
     )
 
 

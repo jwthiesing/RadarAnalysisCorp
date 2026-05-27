@@ -27,7 +27,7 @@ import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -44,11 +44,18 @@ from .poly_editor import PolygonEditor
 
 log = logging.getLogger(__name__)
 
-# Report-category visual specs
+# Report-category visual specs.
+# Edge color encodes the category (so they're distinguishable at any zoom,
+# even when small). Fill color encodes time-of-day via the viridis colormap.
 _REPORT_MARKERS = {
     "tornado": "^",
     "hail": "o",
     "wind": "s",
+}
+_REPORT_EDGE_COLORS = {
+    "tornado": "#ff3030",   # red
+    "hail":    "#22cc55",   # green
+    "wind":    "#3399ff",   # blue
 }
 
 # Convert raw magnitude to scatter marker area (in points²)
@@ -97,6 +104,11 @@ class OverviewMap(QWidget):
         self.is_random_day = is_random_day
         self._enabled_sites: set[str] = set(initial_enabled_sites or set())
         self._site_artists: dict[str, "matplotlib.artist.Artist"] = {}
+        # Per-category bulk scatter artists keyed to the parallel list of
+        # reports drawn in that scatter — used by the hover handler to map a
+        # scatter point's index back to its Report.
+        self._scatter_reports: dict[int, list] = {}
+        self._hover_annotation = None   # built after axes exist
 
         self._figure = Figure(figsize=(10, 7), facecolor="#0a0a0a")
         self._canvas = FigureCanvasQTAgg(self._figure)
@@ -112,18 +124,40 @@ class OverviewMap(QWidget):
 
         self._draw_reports()
         self._draw_radar_sites()
-        # Polygon editor in PlateCarree (x=lon, y=lat) — lat/lon swap on conversion
+        # Polygon editor in PlateCarree (x=lon, y=lat) — lat/lon swap on conversion.
+        # Disabled by default so left-clicks toggle radar sites and don't
+        # double-fire vertex adds. The "Draw polygon" button toggles it on.
         self.poly_editor = PolygonEditor(
             self.ax,
             axes_to_latlon=lambda x, y: (y, x),
             color="#ffd400",
         )
         self.poly_editor.polygon_changed.connect(self.polygon_changed.emit)
+        self.poly_editor.set_enabled(False)
+        self._draw_mode = False
 
         # Click-to-toggle radar sites via separate event handler that runs
         # alongside the polygon clicker (the clicker only listens to picks on
         # its own artists; site dots are separate scatters)
         self._canvas.mpl_connect("pick_event", self._on_pick)
+        # Pan + zoom navigation on the CONUS map.
+        # - Scroll wheel: zoom toward cursor (won't conflict with clicker)
+        # - Middle-click + drag: pan (won't conflict with left-click vertex add
+        #   or right-click vertex delete, which the clicker uses)
+        # - "Reset view" button: jump back to full-CONUS extent.
+        self._home_extent = [-125, -66, 23.5, 50]
+        self._pan_start_px: tuple[float, float] | None = None
+        self._pan_start_extent: list[float] | None = None
+        # Debounce redraws during continuous pan/zoom so rapid scroll-wheel /
+        # drag events coalesce into a single repaint instead of one per event.
+        self._redraw_timer = QTimer(self)
+        self._redraw_timer.setSingleShot(True)
+        self._redraw_timer.setInterval(40)
+        self._redraw_timer.timeout.connect(self._canvas.draw_idle)
+        self._canvas.mpl_connect("scroll_event", self._on_scroll)
+        self._canvas.mpl_connect("button_press_event", self._on_press)
+        self._canvas.mpl_connect("button_release_event", self._on_release)
+        self._canvas.mpl_connect("motion_notify_event", self._on_motion)
 
         # Toolbar / buttons
         toolbar = QHBoxLayout()
@@ -131,9 +165,25 @@ class OverviewMap(QWidget):
         self._reroll_btn.setEnabled(self.is_random_day)
         self._reroll_btn.clicked.connect(self.reroll_requested.emit)
         toolbar.addWidget(self._reroll_btn)
+        self._draw_btn = QPushButton("Draw polygon", self)
+        self._draw_btn.setCheckable(True)
+        self._draw_btn.setToolTip(
+            "Toggle polygon-drawing mode. When ON, left-click adds a vertex "
+            "and right-click removes the nearest. When OFF, left-clicks toggle "
+            "radar sites and pan/zoom work freely."
+        )
+        self._draw_btn.toggled.connect(self._set_draw_mode)
+        toolbar.addWidget(self._draw_btn)
         self._clear_btn = QPushButton("Clear polygon", self)
         self._clear_btn.clicked.connect(self.poly_editor.clear)
         toolbar.addWidget(self._clear_btn)
+        self._reset_view_btn = QPushButton("Reset view", self)
+        self._reset_view_btn.setToolTip(
+            "Scroll wheel zooms toward the cursor. Middle-click drag or "
+            "Shift+left-drag pans. This button returns to the full-CONUS view."
+        )
+        self._reset_view_btn.clicked.connect(self._reset_view)
+        toolbar.addWidget(self._reset_view_btn)
         self._status_label = QLabel(self._status_text(), self)
         toolbar.addWidget(self._status_label)
         toolbar.addStretch(1)
@@ -164,6 +214,7 @@ class OverviewMap(QWidget):
         cmap = "viridis"
         for category, marker in _REPORT_MARKERS.items():
             xs, ys, sizes, ts = [], [], [], []
+            reports_in_scatter: list = []
             for r, t in zip(self.reports, times_sec, strict=False):
                 if r.category != category:
                     continue
@@ -171,13 +222,18 @@ class OverviewMap(QWidget):
                 ys.append(r.lat)
                 sizes.append(_marker_size(category, r.magnitude))
                 ts.append(t)
+                reports_in_scatter.append(r)
             if not xs:
                 continue
-            self.ax.scatter(
+            artist = self.ax.scatter(
                 xs, ys, s=sizes, c=ts, cmap=cmap, norm=norm, marker=marker,
-                edgecolors="#000", linewidths=0.4, alpha=0.85,
+                edgecolors=_REPORT_EDGE_COLORS[category], linewidths=1.0,
+                alpha=0.9,
                 transform=ccrs.PlateCarree(), zorder=5,
             )
+            # Index this artist's points back to their reports so the hover
+            # handler can resolve which report the cursor is over.
+            self._scatter_reports[id(artist)] = reports_in_scatter
 
     def _draw_radar_sites(self) -> None:
         for site in load_sites():
@@ -206,11 +262,151 @@ class OverviewMap(QWidget):
         self._status_label.setText(self._status_text())
         self.radar_sites_changed.emit(set(self._enabled_sites))
 
+    # ---- pan / zoom navigation -----------------------------------------
+
+    def _on_scroll(self, event) -> None:
+        """Scroll wheel = zoom centered on cursor. Won't conflict with the
+        polygon clicker (which listens to button events, not scroll)."""
+        if event.inaxes is not self.ax or event.xdata is None or event.ydata is None:
+            return
+        scale = 0.8 if event.button == "up" else 1.25
+        x, y = event.xdata, event.ydata
+        xmin, xmax = self.ax.get_xlim()
+        ymin, ymax = self.ax.get_ylim()
+        self.ax.set_xlim(x + (xmin - x) * scale, x + (xmax - x) * scale,
+                          emit=False)
+        self.ax.set_ylim(y + (ymin - y) * scale, y + (ymax - y) * scale,
+                          emit=False)
+        self._redraw_timer.start()
+
+    def _on_press(self, event) -> None:
+        """Pan gestures vary by mode so we don't conflict with the polygon clicker.
+
+        Draw mode **OFF** (default — like Google Maps / most web maps):
+          - **Left-drag** pans the map. (A static left-click on a radar X still
+            fires its pick event, so radar toggling keeps working.)
+          - Middle-drag and right-drag also pan, for users with 3-button mice.
+
+        Draw mode **ON**:
+          - Left-click adds a polygon vertex; right-click removes the nearest.
+          - **Shift + left-drag** pans without interrupting vertex placement.
+          - Middle-drag also pans for mouse users.
+        """
+        if event.inaxes is not self.ax:
+            return
+        button = event.button
+        key = (event.key or "").lower()
+        shift_held = "shift" in key
+        if self._draw_mode:
+            is_pan_button = button == 2 or (button == 1 and shift_held)
+        else:
+            # Outside draw mode every drag pans — the most familiar gesture.
+            is_pan_button = button in (1, 2, 3) or (button == 1 and shift_held)
+        if not is_pan_button:
+            return
+        self._pan_start_px = (event.x, event.y)
+        self._pan_start_extent = list(self.ax.get_xlim()) + list(self.ax.get_ylim())
+
+    def _on_release(self, event) -> None:
+        self._pan_start_px = None
+        self._pan_start_extent = None
+
+    def _on_motion(self, event) -> None:
+        # Hover tooltip — runs when not panning. Bulk scatters report their
+        # contained-point indices, which we map back to the underlying Report.
+        if self._pan_start_px is None and event.inaxes is self.ax and self._scatter_reports:
+            self._update_hover_tooltip(event)
+        if (self._pan_start_px is None or self._pan_start_extent is None
+                or event.x is None or event.y is None):
+            return
+        dx_px = event.x - self._pan_start_px[0]
+        dy_px = event.y - self._pan_start_px[1]
+        bbox = self.ax.bbox
+        x0, x1, y0, y1 = self._pan_start_extent
+        dx_data = -(dx_px / max(bbox.width, 1)) * (x1 - x0)
+        dy_data = -(dy_px / max(bbox.height, 1)) * (y1 - y0)
+        self.ax.set_xlim(x0 + dx_data, x1 + dx_data, emit=False)
+        self.ax.set_ylim(y0 + dy_data, y1 + dy_data, emit=False)
+        self._redraw_timer.start()
+
+    def _ensure_hover_annotation(self):
+        if self._hover_annotation is not None:
+            return
+        import cartopy.crs as ccrs
+        self._hover_annotation = self.ax.annotate(
+            "", xy=(0, 0), xytext=(12, 12), textcoords="offset points",
+            color="#0a0a0a", fontsize=9, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#ffd400",
+                      edgecolor="#000", linewidth=0.6, alpha=0.95),
+            transform=ccrs.PlateCarree(), zorder=30,
+        )
+        self._hover_annotation.set_visible(False)
+
+    def _update_hover_tooltip(self, event) -> None:
+        from .radar_panel import _report_tooltip_text
+        self._ensure_hover_annotation()
+        hit_report = None
+        for artist, reports_in in self._scatter_reports.items():
+            for scatter_artist in self.ax.collections:
+                if id(scatter_artist) != artist:
+                    continue
+                try:
+                    contains, info = scatter_artist.contains(event)
+                except (AttributeError, ValueError):
+                    contains, info = False, {}
+                if contains:
+                    inds = info.get("ind", []) if isinstance(info, dict) else []
+                    if len(inds) and inds[0] < len(reports_in):
+                        hit_report = reports_in[inds[0]]
+                        break
+            if hit_report is not None:
+                break
+        if hit_report is None:
+            if self._hover_annotation.get_visible():
+                self._hover_annotation.set_visible(False)
+                self._canvas.draw_idle()
+            return
+        self._hover_annotation.xy = (event.xdata, event.ydata)
+        self._hover_annotation.set_text(_report_tooltip_text(hit_report))
+        if not self._hover_annotation.get_visible():
+            self._hover_annotation.set_visible(True)
+        self._canvas.draw_idle()
+
+    def _reset_view(self) -> None:
+        """Return to the full-CONUS extent set at construction."""
+        import cartopy.crs as ccrs
+        self.ax.set_extent(self._home_extent, crs=ccrs.PlateCarree())
+        self._canvas.draw_idle()
+
+    def _set_draw_mode(self, enabled: bool) -> None:
+        """Toggle polygon-drawing mode. When OFF, left-drag pans the map and
+        left-clicks toggle radar sites. When ON, left-click adds a polygon
+        vertex and right-click removes the nearest one."""
+        self._draw_mode = enabled
+        self.poly_editor.set_enabled(enabled)
+        # Visual cue: cursor + bright button styling
+        if enabled:
+            self._canvas.setCursor(Qt.CursorShape.CrossCursor)
+            self._draw_btn.setText("◉  Drawing — click again to finish")
+            self._draw_btn.setStyleSheet(
+                "QPushButton { background: #ffd400; color: #000; font-weight: bold; }"
+            )
+        else:
+            self._canvas.unsetCursor()
+            self._draw_btn.setText("Draw polygon")
+            self._draw_btn.setStyleSheet("")
+        self._status_label.setText(self._status_text())
+
     def _status_text(self) -> str:
+        if self._draw_mode:
+            hint = "click to add vertices — Draw button again to finish"
+        elif self.poly_editor.polygon() is None:
+            hint = "click radar Xs to enable; Draw polygon to start the boundary"
+        else:
+            hint = "polygon set"
         return (
             f"{len(self.reports)} reports loaded   "
-            f"{len(self._enabled_sites)} radar(s) enabled   "
-            f"{'click radars + click map to draw polygon' if not self.poly_editor.polygon() else 'polygon set'}"
+            f"{len(self._enabled_sites)} radar(s) enabled   {hint}"
         )
 
     # ---- public --------------------------------------------------------
@@ -234,6 +430,9 @@ class OverviewMap(QWidget):
         for artist in list(self.ax.collections):
             artist.remove()
         self._site_artists.clear()
+        self._scatter_reports.clear()
+        if self._hover_annotation is not None:
+            self._hover_annotation.set_visible(False)
         # Reroll = fresh start: the previous polygon and radar choices are
         # tied to a different day, so wipe them.
         self.poly_editor.clear()

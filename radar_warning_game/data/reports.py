@@ -32,11 +32,56 @@ SPC_BACKFILL_THRESHOLD_DAYS = 30
 REPORTS_CACHE = DEFAULT_CACHE_ROOT / "reports"
 REPORTS_CACHE.mkdir(parents=True, exist_ok=True)
 
+# Lightweight per-day counts index: maps "YYYY-MM-DD" → {tornado: N, hail: N, wind: N}.
+# Populated lazily as days are fetched. Lets pick_random_day skip non-qualifying
+# days without paying a fresh HTTP round-trip per candidate.
+_DAILY_COUNTS_PATH = REPORTS_CACHE / "daily_counts.json"
+
 
 def _hashed_path(key: str, suffix: str = ".csv") -> Path:
     """Hash the cache key so the on-disk filename doesn't leak the date."""
     h = hashlib.sha1(key.encode("utf-8")).hexdigest()
     return REPORTS_CACHE / f"{h}{suffix}"
+
+
+def _load_daily_counts() -> dict[str, dict[str, int]]:
+    if not _DAILY_COUNTS_PATH.exists():
+        return {}
+    import json
+    try:
+        return json.loads(_DAILY_COUNTS_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_daily_counts(counts: dict[str, dict[str, int]]) -> None:
+    import json
+    try:
+        tmp = _DAILY_COUNTS_PATH.with_suffix(".json.part")
+        tmp.write_text(json.dumps(counts, separators=(",", ":")))
+        tmp.rename(_DAILY_COUNTS_PATH)
+    except OSError:
+        pass
+
+
+def get_daily_counts(day_12z: datetime) -> dict[str, int] | None:
+    """Return cached counts for the convective day starting at ``day_12z``, or
+    ``None`` if we've never indexed it. Safe to call without network access.
+    """
+    if day_12z.tzinfo is None:
+        day_12z = day_12z.replace(tzinfo=timezone.utc)
+    key = day_12z.strftime("%Y-%m-%d")
+    return _load_daily_counts().get(key)
+
+
+def _record_daily_counts(day_12z: datetime, counts: dict[str, int]) -> None:
+    """Persist a day's category counts into the lightweight index."""
+    if day_12z.tzinfo is None:
+        day_12z = day_12z.replace(tzinfo=timezone.utc)
+    key = day_12z.strftime("%Y-%m-%d")
+    all_counts = _load_daily_counts()
+    all_counts[key] = {k: int(counts.get(k, 0)) for k in ("tornado", "hail", "wind")}
+    _save_daily_counts(all_counts)
 
 # IEM TYPECODE → category
 TORNADO_CODES = frozenset({"T"})
@@ -144,7 +189,12 @@ def _iem_row_to_report(row: pd.Series) -> Report | None:
 
 
 def fetch_iem_window(start: datetime, end: datetime) -> list[Report]:
-    """Fetch all IEM LSRs in ``[start, end]`` (UTC), spanning day caches."""
+    """Fetch all IEM LSRs in ``[start, end]`` (UTC), spanning day caches.
+
+    As a side-effect, records the per-12Z-day category counts into the
+    lightweight daily-counts index so the random-day picker can skip
+    non-qualifying days without re-fetching them.
+    """
     if start.tzinfo is None:
         start = start.replace(tzinfo=timezone.utc)
     if end.tzinfo is None:
@@ -166,6 +216,10 @@ def fetch_iem_window(start: datetime, end: datetime) -> list[Report]:
             if rep is not None:
                 out.append(rep)
         d += timedelta(days=1)
+    # Record counts for the 12Z–12Z convective day starting at ``start`` so the
+    # random-day picker can short-circuit future visits to this day.
+    if start.hour == 12:
+        _record_daily_counts(start, count_by_category(out))
     return out
 
 

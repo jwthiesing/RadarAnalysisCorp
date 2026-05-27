@@ -47,10 +47,12 @@ class MCDFormDialog(QDialog):
         self._duration_spin.setSuffix(" min")
         self._duration_spin.setValue(DEFAULT_DURATION_MIN)
 
-        # PIB pickers — one per hazard
-        self._tor_combo = _pib_combo(self, TORNADO_PIBS, "Tornado")
-        self._wnd_combo = _pib_combo(self, WIND_PIBS, "Wind")
-        self._hal_combo = _pib_combo(self, HAIL_PIBS, "Hail")
+        # PIB pickers — one per hazard. Dropdowns show the exact magnitude
+        # range each bin represents so the player picks a forecast intensity
+        # rather than guessing what a descriptor means.
+        self._tor_combo = _pib_combo(self, TORNADO_PIBS, unit="mph")
+        self._wnd_combo = _pib_combo(self, WIND_PIBS, unit="mph")
+        self._hal_combo = _pib_combo(self, HAIL_PIBS, unit="in")
 
         # Form
         form = QFormLayout()
@@ -106,9 +108,27 @@ class MCDFormDialog(QDialog):
         }
 
 
-def _pib_combo(parent: QWidget, table: tuple[PIBSpec, ...], label: str) -> QComboBox:
+def _pib_combo(parent: QWidget, table: tuple[PIBSpec, ...], *, unit: str) -> QComboBox:
     combo = QComboBox(parent)
     combo.addItem("None (no expected hazard)", 0)
     for spec in table:
-        combo.addItem(f"PIB {spec.pib} — {spec.descriptor}  [{spec.ibw_tag}]", spec.pib)
+        combo.addItem(f"PIB {spec.pib} — {_format_range(spec, unit)}", spec.pib)
     return combo
+
+
+def _format_range(spec: PIBSpec, unit: str) -> str:
+    """Render a PIB's magnitude range using its actual numeric bounds.
+
+    Open-low bins (lower == 0) render as ``"≤ <upper> <unit>"``; open-high
+    bins (upper == inf) render as ``"≥ <lower> <unit>"``; everything else
+    is ``"<lower>–<upper> <unit>"``. Numbers are formatted with up to one
+    decimal place so hail (e.g. 1.25 in) reads naturally without trailing
+    zeros on integer wind speeds.
+    """
+    def _fmt(v: float) -> str:
+        return f"{v:.2f}".rstrip("0").rstrip(".") if v != int(v) else f"{int(v)}"
+    if spec.lower_mph == 0.0:
+        return f"≤ {_fmt(spec.upper_mph)} {unit}"
+    if spec.upper_mph == float("inf"):
+        return f"≥ {_fmt(spec.lower_mph)} {unit}"
+    return f"{_fmt(spec.lower_mph)}–{_fmt(spec.upper_mph)} {unit}"

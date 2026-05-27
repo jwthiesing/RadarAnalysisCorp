@@ -401,6 +401,32 @@ class MainWindow(QMainWindow):
             )
         if self.session.state.value != "PLAYING":
             self.session.begin_play()
+        # Safety net: if for some reason the pregame fetch returned no scans
+        # at or before `time_start` (rare now that prefetch.PREGAME_LOOKBACK
+        # pulls a 20-min lookback window — see data/prefetch.py), snap the
+        # clock forward to the first available sweep so panels aren't blank.
+        # In the common case prefetch has already supplied pre-start volumes
+        # and this branch is a no-op. Skip in live mode (LiveClock reads
+        # wall-clock and the lookback is past wall-clock anyway).
+        if (self.session.round_config.mode != RoundMode.LIVE
+                and self.session.clock is not None):
+            earliest: datetime | None = None
+            for site in self.session.round_config.radar_sites:
+                sweeps = self._prefetcher.sweep_index(site).all_sweeps()
+                if not sweeps:
+                    continue
+                site_first = min(s.start_time for s in sweeps)
+                if earliest is None or site_first < earliest:
+                    earliest = site_first
+            if earliest is not None and earliest > self.session.clock.virtual_time:
+                from ..game.clock import TickState
+                self.session.clock.apply_tick(TickState(
+                    virtual_time=earliest,
+                    speed=self.session.clock.speed,
+                    paused=self.session.clock.paused,
+                ))
+                log.info("Clock snapped to first available sweep at %s",
+                         earliest.strftime("%H:%M:%SZ"))
         # If we're hosting, announce the round to peers now (before play view exists).
         if isinstance(self._multiplayer, MultiplayerHost):
             asyncio.ensure_future(self._multiplayer.announce_round_setup())

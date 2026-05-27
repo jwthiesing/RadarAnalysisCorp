@@ -44,12 +44,17 @@ def _parse_filename(name: str) -> tuple[str, datetime] | None:
     return site, t
 
 
+# Send a polite User-Agent — IEM's mirror logs requests by source and a
+# descriptive UA helps them notice and contact us if they need to.
+_HTTP_HEADERS = {"User-Agent": "RadarAnalysisCorp/0.1 (game; uses IEM live mirror)"}
+
+
 def list_live_volumes(site: str, *, timeout: float = 30.0) -> list[ScanRef]:
     """Scrape the IEM live directory for ``site`` and return ``ScanRef`` list."""
     site = site.upper()
     url = f"{BASE_URL}/{site}/"
     try:
-        r = requests.get(url, timeout=timeout)
+        r = requests.get(url, timeout=timeout, headers=_HTTP_HEADERS)
         r.raise_for_status()
     except requests.RequestException as e:
         log.warning("IEM live listing for %s failed: %s", site, e)
@@ -64,6 +69,7 @@ def list_live_volumes(site: str, *, timeout: float = 30.0) -> list[ScanRef]:
             continue
         refs.append(ScanRef(site=site, time=t, key=f"{site}/{href}"))
     refs.sort(key=lambda r: r.time)
+    log.info("IEM live: %s — %d volumes available", site, len(refs))
     return refs
 
 
@@ -74,12 +80,20 @@ def download_live_volume(scan: ScanRef, cache: HashedCache, *, timeout: float = 
     url = f"{BASE_URL}/{scan.key}"
     tmp = cache.temp_path(scan.key)
     tmp.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(url, stream=True, timeout=timeout) as r:
-        r.raise_for_status()
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=65536):
-                if chunk:
-                    f.write(chunk)
+    try:
+        with requests.get(url, stream=True, timeout=timeout, headers=_HTTP_HEADERS) as r:
+            r.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+    except requests.RequestException as e:
+        log.warning("IEM live download failed for %s: %s", scan.key, e)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return cache.finalize(scan.key)
 
 

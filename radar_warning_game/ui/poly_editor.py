@@ -63,19 +63,71 @@ class PolygonEditor(QObject):
         self._axes_to_latlon = axes_to_latlon
         self._color = color
         self._linewidth = linewidth
-        self._clicker = clicker(
-            ax,
-            classes=["poly"],
-            markers=[marker],
-            colors=[color],
-            disable_legend=True,
+        # Hook canvas.mpl_connect so we can capture the cids the clicker
+        # registers — needed to disconnect/reconnect later for set_enabled().
+        canvas = ax.figure.canvas
+        _orig_mpl_connect = canvas.mpl_connect
+        captured: list[tuple[str, int]] = []
+        def _hook(signal, callback):
+            cid = _orig_mpl_connect(signal, callback)
+            captured.append((signal, cid))
+            return cid
+        canvas.mpl_connect = _hook   # type: ignore[method-assign]
+        try:
+            self._clicker = clicker(
+                ax,
+                classes=["poly"],
+                markers=[marker],
+                colors=[color],
+                disable_legend=True,
+            )
+        finally:
+            canvas.mpl_connect = _orig_mpl_connect   # type: ignore[method-assign]
+        # Workaround for an mpl_point_clicker bug: with disable_legend=True the
+        # clicker never creates `_leg_artists`, but its pick-event handler reads
+        # it unconditionally. Any pick event in the figure (e.g. our radar-site
+        # click-toggles) would then crash inside the clicker. Pre-populate the
+        # dict so the lookup returns None cleanly.
+        if not hasattr(self._clicker, "_leg_artists"):
+            self._clicker._leg_artists = {}
+        # Remember the clicker's button_press_event cid so we can disable
+        # vertex-add without throwing away the clicker entirely.
+        self._clicker_button_cid: int | None = next(
+            (cid for sig, cid in captured if sig == "button_press_event"), None
         )
+        self._enabled = True
         self._outline_line = None
         self._clicker.on_point_added(self._on_changed)
         self._clicker.on_point_removed(self._on_changed)
         self._clicker.on_positions_set(self._on_changed)
 
     # ---- public API ------------------------------------------------------
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Toggle the clicker's vertex-add handler.
+
+        When disabled, left-clicks fall through to other listeners (radar-site
+        picks, pan handlers). The polygon's existing vertices are preserved
+        and remain visible.
+        """
+        if enabled == self._enabled:
+            return
+        canvas = self.ax.figure.canvas
+        if enabled:
+            # Re-register the clicker's button-press handler
+            if self._clicker_button_cid is None:
+                self._clicker_button_cid = canvas.mpl_connect(
+                    "button_press_event", self._clicker._clicked,
+                )
+        else:
+            if self._clicker_button_cid is not None:
+                canvas.mpl_disconnect(self._clicker_button_cid)
+                self._clicker_button_cid = None
+        self._enabled = enabled
 
     def vertices_axes(self) -> np.ndarray:
         """Vertex array in axes coords, shape ``(N, 2)``."""

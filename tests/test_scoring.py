@@ -105,6 +105,109 @@ def test_svr_with_only_one_predicted_component():
     assert ws.magnitude_bonus == pytest.approx(0.5)
 
 
+def test_tor_hail_tag_perfect_match_earns_bonus():
+    """Tornado warning with an IBW hail tag scores the hail prediction
+    against actual hail inside the polygon — even though hail doesn't
+    'verify' a tornado warning. Verified by a tornado report; perfect
+    hail match → full magnitude bonus."""
+    w = _w(wt=WarningType.TOR, mag=Magnitudes(hail_in=2.0))
+    rs = [
+        _r(category="tornado", magnitude=1.0),
+        _r(category="hail", magnitude=2.0, time=_T0+timedelta(minutes=15)),
+    ]
+    ws = score_single_warning(w, rs)
+    assert ws.magnitude_bonus == pytest.approx(0.5)
+
+
+def test_tor_hail_tag_no_hail_observed_zero_bonus():
+    """Tornado warning with hail tag but no hail in the polygon → 0 bonus
+    (penalizes the unrealized hail prediction)."""
+    w = _w(wt=WarningType.TOR, mag=Magnitudes(hail_in=2.0))
+    r = _r(category="tornado", magnitude=1.0)
+    ws = score_single_warning(w, [r])
+    assert ws.magnitude_bonus == pytest.approx(0.0)
+
+
+def test_svr_tornado_possible_adds_bonus_when_tornado_in_polygon():
+    """SVR with 'Tornado Possible' tag + tornado inside the polygon during
+    the warning's valid time earns a flat bonus on top of any hail/wind
+    score. The tornado does NOT verify the SVR (POD-wise), but it
+    contributes to points."""
+    from radar_warning_game.verification.scoring import SVR_TORNADO_POSSIBLE_BONUS
+    w = _w(wt=WarningType.SVR, mag=Magnitudes(
+        hail_in=2.0, wind_mph=70, tornado_possible=True,
+    ))
+    rs = [
+        _r(category="hail", magnitude=2.0),
+        _r(category="tornado", magnitude=1.0, time=_T0+timedelta(minutes=15)),
+    ]
+    ws = score_single_warning(w, rs)
+    # Base SVR with perfect hail (wind unverified) = mag_bonus 0.25 → 125
+    # Plus SVR_TORNADO_POSSIBLE_BONUS for the tornado in the polygon.
+    assert ws.points == pytest.approx(BASE_SVR_POINTS * 1.25 + SVR_TORNADO_POSSIBLE_BONUS)
+    assert ws.is_false_alarm is False
+
+
+def test_svr_tornado_possible_no_tornado_means_no_bonus():
+    """If the SVR's tornado-possible tag is set but no tornado actually
+    occurs, the bonus is NOT awarded — the SVR scores like a normal SVR."""
+    w = _w(wt=WarningType.SVR, mag=Magnitudes(
+        hail_in=2.0, wind_mph=70, tornado_possible=True,
+    ))
+    rs = [_r(category="hail", magnitude=2.0)]
+    ws = score_single_warning(w, rs)
+    # Same as the no-TP case: base 100 × 1 × (1 + 0.25 mag) = 125
+    assert ws.points == pytest.approx(BASE_SVR_POINTS * 1.25)
+
+
+def test_svr_tornado_possible_rescues_from_fa_with_only_tornado():
+    """An SVR-TP that catches ONLY a tornado (no hail/wind verifies) is
+    not a false alarm — the bonus is the entire score."""
+    from radar_warning_game.verification.scoring import SVR_TORNADO_POSSIBLE_BONUS
+    w = _w(wt=WarningType.SVR, mag=Magnitudes(
+        hail_in=None, wind_mph=None, tornado_possible=True,
+    ))
+    rs = [_r(category="tornado", magnitude=1.0)]
+    ws = score_single_warning(w, rs)
+    assert ws.is_false_alarm is False
+    assert ws.points == pytest.approx(SVR_TORNADO_POSSIBLE_BONUS)
+
+
+def test_svr_tornado_possible_off_tornado_doesnt_help():
+    """An SVR without the tornado-possible tag does NOT get a bonus from
+    a tornado in its polygon — the tag is opt-in."""
+    w = _w(wt=WarningType.SVR, mag=Magnitudes(
+        hail_in=2.0, wind_mph=70, tornado_possible=False,
+    ))
+    rs = [
+        _r(category="hail", magnitude=2.0),
+        _r(category="tornado", magnitude=1.0, time=_T0+timedelta(minutes=15)),
+    ]
+    ws = score_single_warning(w, rs)
+    assert ws.points == pytest.approx(BASE_SVR_POINTS * 1.25)   # no TP bonus
+
+
+def test_hail_predicted_zero_no_hail_observed_gets_full_credit():
+    """An SVR that correctly predicts 'no hail' (hail_in=0) and verifies
+    via wind only should earn full hail-component credit, not zero."""
+    w = _w(wt=WarningType.SVR, mag=Magnitudes(hail_in=0.0, wind_mph=70))
+    r = _r(category="wind", magnitude=70.0)
+    ws = score_single_warning(w, [r])
+    # Hail component = 1.0 (correct "no hail" call); wind = 1.0 → mean 1.0 → bonus 0.5
+    assert ws.magnitude_bonus == pytest.approx(0.5)
+
+
+def test_tor_with_no_magnitudes_earns_no_magnitude_bonus():
+    """A bare tornado warning (no hail, no EF) has nothing to score
+    against, so magnitude_bonus is 0 — the player only earns base TOR
+    points × tier multiplier."""
+    w = _w(wt=WarningType.TOR, mag=Magnitudes())
+    r = _r(category="tornado", magnitude=2.0)
+    ws = score_single_warning(w, [r])
+    assert ws.magnitude_bonus == pytest.approx(0.0)
+    assert ws.points == pytest.approx(BASE_TOR_POINTS)
+
+
 def test_pds_tor_with_ef3_gets_175x():
     w = _w(wt=WarningType.PDS_TOR, mag=Magnitudes(ef=3.0))
     r = _r(magnitude=3.0, inj=3, fat=1)

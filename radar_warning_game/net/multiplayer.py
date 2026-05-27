@@ -132,7 +132,10 @@ class _SessionApplier:
             warning_type=WarningType(msg.warning_type),
             polygon=_payload_poly(msg.polygon_latlon),
             duration=timedelta(seconds=msg.duration_sec),
-            magnitudes=Magnitudes(hail_in=msg.hail_in, wind_mph=msg.wind_mph, ef=msg.ef),
+            magnitudes=Magnitudes(
+                hail_in=msg.hail_in, wind_mph=msg.wind_mph, ef=msg.ef,
+                tornado_possible=getattr(msg, "tornado_possible", False),
+            ),
             warning_id=msg.warning_id,
             issue_time=self._offset_to_dt(msg.issue_offset_sec),
         )
@@ -150,7 +153,10 @@ class _SessionApplier:
                 warning_type=WarningType(msg.warning_type),
                 polygon=_payload_poly(msg.polygon_latlon),
                 duration=timedelta(seconds=msg.duration_sec),
-                magnitudes=Magnitudes(hail_in=msg.hail_in, wind_mph=msg.wind_mph, ef=msg.ef),
+                magnitudes=Magnitudes(
+                    hail_in=msg.hail_in, wind_mph=msg.wind_mph, ef=msg.ef,
+                    tornado_possible=getattr(msg, "tornado_possible", False),
+                ),
             ))
             return
 
@@ -278,6 +284,7 @@ class MultiplayerHost(_SessionApplier):
                                 hail_in=rev.magnitudes.hail_in,
                                 wind_mph=rev.magnitudes.wind_mph,
                                 ef=rev.magnitudes.ef,
+                                tornado_possible=rev.magnitudes.tornado_possible,
                             )))
                     if w.canceled_at:
                         await self.transport.send_to(peer_id, proto.encode(

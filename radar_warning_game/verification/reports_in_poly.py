@@ -36,11 +36,19 @@ DEFAULT_VERIFICATION_BUFFER_KM = 5.0
 
 @dataclass(frozen=True)
 class Magnitudes:
-    """Per-warning expected magnitudes (whichever apply to the type)."""
+    """Per-warning expected magnitudes (whichever apply to the type).
+
+    ``tornado_possible`` is the NWS IBW "Tornado Possible" tag that can be
+    attached to a Severe Thunderstorm Warning. When True and the warning
+    catches an actual tornado inside its footprint, the scoring engine
+    awards a flat bonus (a less powerful version of a TOR's verification
+    credit) — see :mod:`radar_warning_game.verification.scoring`.
+    """
 
     hail_in: float | None = None
     wind_mph: float | None = None
     ef: float | None = None
+    tornado_possible: bool = False
 
 
 @dataclass(frozen=True)

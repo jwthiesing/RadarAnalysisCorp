@@ -29,6 +29,15 @@ from .sweep_index import SweepIndex
 
 log = logging.getLogger(__name__)
 
+PREGAME_LOOKBACK = timedelta(minutes=20)
+"""How far before the round's start time to also pull volumes for.
+
+Gives the player visible radar history at t=0 and ensures the clock can
+actually start AT the round start time (vs. snapping forward to whatever
+first scan landed after it). The cost is ~3-4 extra volumes per radar at
+typical NEXRAD cadence.
+"""
+
 PREGAME_WINDOW = timedelta(minutes=30)
 INGAME_LOOKAHEAD = timedelta(minutes=20)
 DEFAULT_PARALLELISM = 8
@@ -81,9 +90,18 @@ class Prefetcher:
     # ------------------------------ phase 1: pre-game ----------------------
 
     def schedule_pregame(self, start: datetime, end: datetime) -> list[Future]:
-        """Schedule download of all volumes in ``[start, start + PREGAME_WINDOW]`` per site.
+        """Schedule download of pre-game volumes.
 
-        Returns the list of in-flight futures so the caller can join / report progress.
+        Historical rounds: ``[start - PREGAME_LOOKBACK, start + PREGAME_WINDOW]``
+        — the 20 minutes leading up to ``start`` plus the first 30 minutes of
+        the round itself. The lookback ensures (a) the clock can begin at the
+        nominal start time with a sweep already available rather than waiting
+        for whatever scan landed after it, and (b) the player sees ~20 min of
+        recent radar history when the round opens.
+
+        Live rounds: ``[now - PREGAME_WINDOW, now]`` — the most recent 30
+        minutes the IEM live mirror has. Live volumes are by definition in
+        the recent past; reading from ``start`` (= now) forward returns nothing.
         """
         if start.tzinfo is None:
             start = start.replace(tzinfo=timezone.utc)
@@ -91,10 +109,16 @@ class Prefetcher:
             end = end.replace(tzinfo=timezone.utc)
         self._round_start = start
         self._round_end = end
-        target_end = min(start + PREGAME_WINDOW, end)
+        if self._live_source:
+            now = datetime.now(timezone.utc)
+            target_start = now - PREGAME_WINDOW
+            target_end = now
+        else:
+            target_start = start - PREGAME_LOOKBACK
+            target_end = min(start + PREGAME_WINDOW, end)
         futures: list[Future] = []
         for site, state in self._states.items():
-            scans = self._list_scans(site, start, target_end)
+            scans = self._list_scans(site, target_start, target_end)
             state.pregame_total = len(scans)
             for scan in scans:
                 fut = self._submit_if_new(state, scan)
@@ -138,10 +162,19 @@ class Prefetcher:
             return []
         if virtual_time.tzinfo is None:
             virtual_time = virtual_time.replace(tzinfo=timezone.utc)
-        horizon = min(virtual_time + INGAME_LOOKAHEAD, self._round_end)
+        if self._live_source:
+            # Live mode: poll backwards for newly-arrived volumes. The cache
+            # dedupes, so re-listing every tick is cheap (only NEW volumes
+            # trigger fetches).
+            now = datetime.now(timezone.utc)
+            window_start = now - INGAME_LOOKAHEAD
+            window_end = now
+        else:
+            window_start = virtual_time
+            window_end = min(virtual_time + INGAME_LOOKAHEAD, self._round_end)
         futures: list[Future] = []
         for site, state in self._states.items():
-            scans = self._list_scans(site, virtual_time, horizon)
+            scans = self._list_scans(site, window_start, window_end)
             for scan in scans:
                 fut = self._submit_if_new(state, scan)
                 if fut is not None:

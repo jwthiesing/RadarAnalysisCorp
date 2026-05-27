@@ -62,8 +62,15 @@ _TIER_LINEWIDTH = {
     WarningType.TORE: 3.0,
 }
 
-# Report visual specs (same scheme as OverviewMap, but with fade alpha)
+# Report visual specs (same scheme as OverviewMap, but with fade alpha).
+# Edge color encodes the report category — clearly distinguishable at any
+# zoom level, including very small markers from low-magnitude reports.
 _REPORT_MARKERS = {"tornado": "^", "hail": "o", "wind": "s"}
+_REPORT_EDGE_COLORS = {
+    "tornado": "#ff3030",
+    "hail":    "#22cc55",
+    "wind":    "#3399ff",
+}
 
 REPORT_FADE_SEC = 30 * 60   # full fade after 30 game-minutes (plan §6)
 
@@ -86,6 +93,11 @@ class HostCentralMap(QWidget):
         self._report_artists: list = []
         self._site_artists: dict[str, "matplotlib.artist.Artist"] = {}
         self._polygon_lookup: dict = {}     # artist → (kind, owner_id, id) for click handling
+        # Hover tooltip state — single annotation that follows the cursor
+        # when over a report, hidden otherwise. Sidecar dict resolves the
+        # scatter artist back to the Report it represents.
+        self._report_meta: dict[int, "Report"] = {}
+        self._hover_annotation = None   # built after axes exist
 
         # Map canvas
         self._figure = Figure(figsize=(10, 7), facecolor="#0a0a0a")
@@ -133,6 +145,16 @@ class HostCentralMap(QWidget):
 
         # Pick handler
         self._canvas.mpl_connect("pick_event", self._on_pick)
+        # Hover handler — show tooltip when cursor is over a report scatter
+        self._hover_annotation = self.ax.annotate(
+            "", xy=(0, 0), xytext=(12, 12), textcoords="offset points",
+            color="#0a0a0a", fontsize=9, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#ffd400",
+                      edgecolor="#000", linewidth=0.6, alpha=0.95),
+            transform=ccrs.PlateCarree(), zorder=30,
+        )
+        self._hover_annotation.set_visible(False)
+        self._canvas.mpl_connect("motion_notify_event", self._on_motion)
 
         # Initial refresh
         self.refresh()
@@ -196,6 +218,9 @@ class HostCentralMap(QWidget):
         self._warning_artists.clear()
         self._report_artists.clear()
         self._polygon_lookup.clear()
+        self._report_meta.clear()
+        if self._hover_annotation is not None:
+            self._hover_annotation.set_visible(False)
 
     def _draw_warnings(self) -> None:
         for issuer_id, warnings in self.session.warnings_by_player.items():
@@ -274,13 +299,21 @@ class HostCentralMap(QWidget):
                 alphas.append(alpha)
             if not xs:
                 continue
-            for x, y, s, a in zip(xs, ys, sizes, alphas, strict=True):
+            visible = [
+                r for r in self.session.round_day.reports
+                if r.category == category
+                and r.time <= now
+                and (now - r.time).total_seconds() <= REPORT_FADE_SEC * 1.5
+            ]
+            for r, x, y, s, a in zip(visible, xs, ys, sizes, alphas, strict=True):
                 artist = self.ax.scatter(
                     [x], [y], s=s, c=_report_color(category), marker=marker,
-                    alpha=a, edgecolors="#000", linewidths=0.4,
+                    alpha=a, edgecolors=_REPORT_EDGE_COLORS[category],
+                    linewidths=1.0,
                     transform=ccrs.PlateCarree(), zorder=6,
                 )
                 self._report_artists.append(artist)
+                self._report_meta[id(artist)] = r
 
     def _on_pick(self, event) -> None:
         artist = event.artist
@@ -289,6 +322,37 @@ class HostCentralMap(QWidget):
             return
         kind, owner_id, item_id = info
         self._details_box.setHtml(_format_details(self.session, kind, owner_id, item_id))
+
+    def _on_motion(self, event) -> None:
+        """Show the hover tooltip when the cursor is over a report scatter."""
+        if (self._hover_annotation is None
+                or event.inaxes is not self.ax
+                or not self._report_meta):
+            if self._hover_annotation is not None and self._hover_annotation.get_visible():
+                self._hover_annotation.set_visible(False)
+                self._canvas.draw_idle()
+            return
+        from .radar_panel import _report_tooltip_text
+        hit_report = None
+        for artist in self._report_artists:
+            try:
+                contains, _info = artist.contains(event)
+            except (AttributeError, ValueError):
+                continue
+            if contains:
+                hit_report = self._report_meta.get(id(artist))
+                if hit_report is not None:
+                    break
+        if hit_report is None:
+            if self._hover_annotation.get_visible():
+                self._hover_annotation.set_visible(False)
+                self._canvas.draw_idle()
+            return
+        self._hover_annotation.xy = (event.xdata, event.ydata)
+        self._hover_annotation.set_text(_report_tooltip_text(hit_report))
+        if not self._hover_annotation.get_visible():
+            self._hover_annotation.set_visible(True)
+        self._canvas.draw_idle()
 
 
 # ---------------------------- helpers -----------------------------------------

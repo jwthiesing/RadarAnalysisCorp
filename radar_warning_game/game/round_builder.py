@@ -21,6 +21,7 @@ from ..data.reports import (
     Report,
     count_by_category,
     fetch_iem_window,
+    get_daily_counts,
 )
 
 # Date range bounds (plan locked decision)
@@ -97,15 +98,26 @@ def pick_random_day(
     if range_end <= range_start:
         raise ValueError("Effective date range is empty (range_start ≥ range_end)")
     total_days = (range_end - range_start).days
+    # The daily-counts index lets us skip non-qualifying days without a fresh
+    # network round-trip per attempt. For days we've never indexed we still
+    # fetch (which is what populates the index).
+    seen_keys: set[str] = set()
     for _ in range(max_tries):
         offset = rng.randint(0, total_days)
         candidate = range_start + timedelta(days=offset)
-        # Snap to 12Z
         candidate = candidate.replace(hour=12, minute=0, second=0, microsecond=0)
+        key = candidate.strftime("%Y-%m-%d")
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        cached_counts = get_daily_counts(candidate)
+        if cached_counts is not None:
+            if not spec.is_met(cached_counts):
+                continue   # known to not qualify — skip without a fetch
+            # Counts qualify; still need to fetch the full reports list
         try:
             day = pick_specific_day(candidate)
         except Exception as e:  # noqa: BLE001
-            # IEM fetch may fail intermittently; just try another day
             print(f"[round_builder] fetch failed for {candidate:%Y-%m-%d}: {e}")
             continue
         if spec.is_met(day.counts):

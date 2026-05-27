@@ -54,6 +54,14 @@ BASE_TOR_FA_PENALTY = 120.0
 
 MAG_ACCURACY_WEIGHT = 0.5   # max boost from perfect magnitude prediction (0 → 1.0×, 1 → 1.5×)
 
+# Flat bonus added to an SVR-family warning that carries the "Tornado
+# Possible" IBW tag when a tornado actually occurs inside the polygon
+# during its valid time. Tuned to roughly half of BASE_TOR_POINTS — the
+# player flagged the possibility but didn't commit to a TOR, so partial
+# credit is appropriate. Also rescues the warning from FA classification
+# if neither hail nor wind verified.
+SVR_TORNADO_POSSIBLE_BONUS = 80.0
+
 # MCD scoring
 MCD_PIB_PERFECT_HAZARD_POINTS = 80.0  # per hazard for delta=0 (max accuracy)
 MCD_PIB_FA_PENALTY_PER_PIB = 20.0    # for predicting PIB N when observed=0; scales with N
@@ -140,7 +148,101 @@ def _sum_casualties(matches: list[VerifyingMatch]) -> int:
     return sum(m.report.injuries + m.report.fatalities for m in matches)
 
 
-def _magnitude_accuracy(warning, matches: list[VerifyingMatch]) -> float:
+def _reports_in_warning(
+    warning: Warning,
+    reports: list[Report],
+    category: str,
+    *,
+    buffer_km: float = DEFAULT_VERIFICATION_BUFFER_KM,
+) -> list[Report]:
+    """All reports of ``category`` inside the warning polygon during its valid
+    window — irrespective of whether the report's category verifies the
+    warning type. Used to score cross-hazard magnitude predictions (e.g. the
+    hail tag on a tornado warning).
+    """
+    out: list[Report] = []
+    issue = warning.original_issue_time
+    end = warning.end_time()
+    for r in reports:
+        if r.category != category:
+            continue
+        if not (issue <= r.time <= end):
+            continue
+        rev = warning.revision_at(r.time) or warning.revisions[0]
+        if contains_with_buffer(rev.polygon, r.lat, r.lon, buffer_km=buffer_km):
+            out.append(r)
+    return out
+
+
+def _hail_component(
+    warning: Warning,
+    hail_reports: list[Report],
+) -> float | None:
+    """0..1 accuracy for the hail prediction.
+
+    Returns:
+      - ``None`` when the warning carries no hail prediction (``hail_in =
+        None``, i.e. the player picked "(no hail tag)") — component is
+        skipped entirely and contributes nothing to the magnitude mean.
+      - A numeric score otherwise. A predicted value of ``0`` means "no
+        hail expected" — full credit if none materializes, miss if hail
+        occurs. Positive predictions are scored by standard accuracy
+        (``1 − |predicted − peak| / peak``), with the revision active at
+        the peak hail's report time.
+    """
+    cur_mag = warning.current_revision.magnitudes
+    if cur_mag.hail_in is None:
+        return None
+    predicted = float(cur_mag.hail_in)
+    if not hail_reports:
+        # No hail observed inside the warning footprint.
+        # Predicted no hail → correct call (full credit).
+        # Predicted hail → over-prediction (zero accuracy).
+        return 1.0 if predicted <= 0.0 else 0.0
+    peak = max(hail_reports, key=lambda r: r.magnitude)
+    if peak.magnitude <= 0:
+        return 1.0 if predicted <= 0.0 else 0.0
+    rev = warning.revision_at(peak.time) or warning.revisions[0]
+    if rev.magnitudes.hail_in is None:
+        return 0.0
+    pred_at_peak = float(rev.magnitudes.hail_in)
+    if pred_at_peak <= 0.0:
+        return 0.0   # claimed no hail but hail occurred → miss
+    err = abs(pred_at_peak - peak.magnitude) / max(peak.magnitude, 0.5)
+    return max(0.0, 1.0 - err)
+
+
+def _wind_component(
+    warning: Warning,
+    wind_reports: list[Report],
+) -> float | None:
+    """0..1 accuracy for the wind-gust prediction. ``None`` when the
+    warning carries no wind tag; a predicted ``0`` means "no wind threat
+    expected" and is scored symmetrically to the hail component."""
+    cur_mag = warning.current_revision.magnitudes
+    if cur_mag.wind_mph is None:
+        return None
+    predicted = float(cur_mag.wind_mph)
+    if not wind_reports:
+        return 1.0 if predicted <= 0.0 else 0.0
+    peak = max(wind_reports, key=lambda r: r.magnitude)
+    if peak.magnitude <= 0:
+        return 1.0 if predicted <= 0.0 else 0.0
+    rev = warning.revision_at(peak.time) or warning.revisions[0]
+    if rev.magnitudes.wind_mph is None:
+        return 0.0
+    pred_at_peak = float(rev.magnitudes.wind_mph)
+    if pred_at_peak <= 0.0:
+        return 0.0
+    err = abs(pred_at_peak - peak.magnitude) / max(peak.magnitude, 30.0)
+    return max(0.0, 1.0 - err)
+
+
+def _magnitude_accuracy(
+    warning,
+    matches: list[VerifyingMatch],
+    reports: list[Report],
+) -> float:
     """Return a 0..1 accuracy fraction for the warning's magnitude estimates.
 
     Per plan §5: peak observed is computed over the full warning lifetime, and
@@ -148,64 +250,58 @@ def _magnitude_accuracy(warning, matches: list[VerifyingMatch]) -> float:
     — so a player who initially nailed an estimate and later revised it isn't
     penalized for the later revision.
 
-    SVR is scored component-wise (hail + wind separately):
-      - If the player predicted a value AND a report of that type verified:
-        standard accuracy = 1 − |predicted − peak observed| / peak observed.
-      - If the player predicted a value but NO report of that type verified
-        within the warning: contribute 0 (penalizes unrealized over-predictions).
-      - If the player predicted no value for that component (None): component
-        skipped entirely.
-      - Final magnitude = mean of the contributing components.
+    Component-wise scoring:
+      - SVR family: hail (if predicted) + wind (if predicted). Hail/wind
+        observations come from the verifying matches — i.e. hail ≥1.0" or
+        wind ≥58 mph that actually verified the SVR.
+      - TOR family: hail (if predicted; this is the NWS IBW hail tag on a
+        tornado warning) + EF (legacy/programmatic-only — the UI no longer
+        exposes it, but the data model keeps it). Hail reports come from the
+        full ``reports`` list filtered to the warning polygon and window,
+        since they are not "verifying" reports for a tornado warning but
+        the player did stake a magnitude claim that should be scored.
+      - Either family: components that the player did NOT predict are
+        skipped (no contribution).
+      - Final magnitude = mean of contributing components.
     """
     warning_type = warning.current_revision.warning_type
+    components: list[float] = []
     if warning_type.is_severe_family:
-        components: list[float] = []
+        # SVR hail / wind components — sourced from verifying matches so
+        # sub-severe hail (<1") doesn't count toward an SVR's magnitude
+        # bonus (it never verified the SVR in the first place).
+        hail_reports = [m.report for m in matches if m.report.category == "hail"]
+        wind_reports = [m.report for m in matches if m.report.category == "wind"]
+        for comp in (_hail_component(warning, hail_reports),
+                     _wind_component(warning, wind_reports)):
+            if comp is not None:
+                components.append(comp)
+    elif warning_type.is_tornado_family:
+        # Tornado-warning hail tag (NWS IBW practice) — uses any hail report
+        # in the polygon during the warning, not just severe-threshold hail.
         cur_mag = warning.current_revision.magnitudes
-        # Hail component
         if cur_mag.hail_in is not None:
-            hail_matches = [m for m in matches if m.report.category == "hail"]
-            if hail_matches:
-                peak = max(hail_matches, key=lambda m: m.report.magnitude)
-                if peak.report.magnitude > 0:
-                    rev = warning.revision_at(peak.report.time) or warning.revisions[0]
-                    if rev.magnitudes.hail_in is not None:
-                        err = abs(rev.magnitudes.hail_in - peak.report.magnitude) / max(peak.report.magnitude, 0.5)
-                        components.append(max(0.0, 1.0 - err))
-                    else:
-                        components.append(0.0)
-                else:
-                    components.append(0.0)
-            else:
-                # Predicted but no hail report verified — count as zero accuracy
-                components.append(0.0)
-        # Wind component
-        if cur_mag.wind_mph is not None:
-            wind_matches = [m for m in matches if m.report.category == "wind"]
-            if wind_matches:
-                peak = max(wind_matches, key=lambda m: m.report.magnitude)
-                if peak.report.magnitude > 0:
-                    rev = warning.revision_at(peak.report.time) or warning.revisions[0]
-                    if rev.magnitudes.wind_mph is not None:
-                        err = abs(rev.magnitudes.wind_mph - peak.report.magnitude) / max(peak.report.magnitude, 30.0)
-                        components.append(max(0.0, 1.0 - err))
-                    else:
-                        components.append(0.0)
+            hail_reports = _reports_in_warning(warning, reports, "hail")
+            comp = _hail_component(warning, hail_reports)
+            if comp is not None:
+                components.append(comp)
+        # Legacy EF magnitude scoring — kept so programmatic/test code that
+        # sets `Magnitudes.ef` still earns a bonus, even though the UI no
+        # longer exposes the field.
+        if cur_mag.ef is not None:
+            tor_matches = [m for m in matches
+                           if m.report.category == "tornado" and m.report.magnitude >= 0]
+            if tor_matches:
+                peak = max(tor_matches, key=lambda m: m.report.magnitude)
+                rev = warning.revision_at(peak.report.time) or warning.revisions[0]
+                if rev.magnitudes.ef is not None:
+                    err = abs(rev.magnitudes.ef - peak.report.magnitude) / max(peak.report.magnitude, 1.0)
+                    components.append(max(0.0, 1.0 - err))
                 else:
                     components.append(0.0)
             else:
                 components.append(0.0)
-        return sum(components) / len(components) if components else 0.0
-    if warning_type.is_tornado_family:
-        # Peak EF: scored against revision active at the peak EF's report time
-        tor_matches = [m for m in matches if m.report.category == "tornado" and m.report.magnitude >= 0]
-        if tor_matches:
-            peak = max(tor_matches, key=lambda m: m.report.magnitude)
-            rev = warning.revision_at(peak.report.time) or warning.revisions[0]
-            if rev.magnitudes.ef is not None:
-                err = abs(rev.magnitudes.ef - peak.report.magnitude) / max(peak.report.magnitude, 1.0)
-                return max(0.0, 1.0 - err)
-        return 0.0
-    return 0.0
+    return sum(components) / len(components) if components else 0.0
 
 
 def _tier_multiplier_for_match(warning_type: WarningType, match: VerifyingMatch) -> float:
@@ -243,9 +339,24 @@ def score_single_warning(warning: Warning, reports: list[Report]) -> WarningScor
     matches = find_verifying_reports(warning, reports)
     is_fa = len(matches) == 0
     current_type = warning.current_revision.warning_type
+    cur_mag = warning.current_revision.magnitudes
 
-    mag_acc = _magnitude_accuracy(warning, matches)
+    mag_acc = _magnitude_accuracy(warning, matches, reports)
     mag_bonus = mag_acc * MAG_ACCURACY_WEIGHT
+
+    # "Tornado Possible" IBW tag on an SVR: flat bonus when an actual
+    # tornado fell inside the polygon during the warning's valid time.
+    # Tornadoes aren't part of `find_verifying_reports` for the SVR family
+    # (verifies_warning_type filters to hail/wind), so we look them up
+    # separately and only add the bonus once per warning.
+    tp_bonus = 0.0
+    if current_type.is_severe_family and cur_mag.tornado_possible:
+        tor_in_poly = _reports_in_warning(warning, reports, "tornado")
+        if tor_in_poly:
+            tp_bonus = SVR_TORNADO_POSSIBLE_BONUS
+            # Catching a tornado the player flagged saves the warning from
+            # FA classification even if no hail/wind verified.
+            is_fa = False
 
     if is_fa:
         # FA: tier from the most-recent revision
@@ -269,8 +380,16 @@ def score_single_warning(warning: Warning, reports: list[Report]) -> WarningScor
     per_match_mults = [
         _tier_multiplier_for_match(m.revision.warning_type, m) for m in matches
     ]
-    mean_tier = sum(per_match_mults) / len(per_match_mults)
-    points = mean_tier * (1.0 + mag_bonus) * base_pts
+    if per_match_mults:
+        mean_tier = sum(per_match_mults) / len(per_match_mults)
+        base_score = mean_tier * (1.0 + mag_bonus) * base_pts
+    else:
+        # No hail/wind verifying matches — the warning was rescued from FA
+        # by the tornado-possible tag alone. No hail/wind base score; only
+        # the tp_bonus contributes.
+        mean_tier = 1.0
+        base_score = 0.0
+    points = base_score + tp_bonus
     return WarningScore(
         warning=warning, verifying=matches,
         tier_mult=mean_tier,
