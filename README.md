@@ -49,7 +49,7 @@ On the **CONUS overview** screen, click **`Draw polygon`** to enter polygon-draw
 
 The host clicks **radar-site markers** to enable (cyan) or disable each radar for the round. **WSR-88Ds** are drawn as X's, **TDWRs** as smaller circles in lavender — the same toggle gesture applies to both. Inactive radars are unavailable to all players, simulating downed radars. A background thread probes the Unidata Level 2 archive for each site on the chosen day; sites with no coverage for that date are dimmed and refuse selection. TDWR archive coverage on the Unidata mirror is patchy in older years, so for pre-2010ish events the TDWR fleet will mostly grey out — but for modern events you can grab a TDWR for inner-city tornado scenarios where its sub-1°-elevation low scans see things the WSR-88D's beam overshoots.
 
-When the initial radar of a round is a TDWR, the play view opens in a 2-panel **REF / VEL** layout by default (Alt+1 / Alt+2 / Alt+4 still toggle). TDWR Level 2 from Unidata only carries REF, VEL, and SW — there is no CC / ZDR / KDP / PHI, so the default 4-panel REF/VEL/CC/ZDR layout would leave the dual-pol panels permanently blank.
+When the initial radar of a round is a TDWR, the play view opens in a 2-panel **REF / VEL** layout by default (Alt+1 / Alt+2 / Alt+4 still toggle). TDWR Level 2 from Unidata only carries REF, VEL, and SW — there is no CC / ZDR / PHI, so the default 4-panel REF/VEL/CC/ZDR layout would leave the dual-pol panels permanently blank.
 
 After the polygon is drawn, the host's status bar shows `polygon set` and the **`Continue to time window →`** button advances to the time histogram. In historical mode the host drags a span over the day's storm-report distribution to pick the game window. **`Start round →`** kicks off radar prefetch. Once the radar data lands, the **PlayView** opens.
 
@@ -84,7 +84,9 @@ Every shortcut is a `QShortcut` at the `PlayView` level, so they fire regardless
 | `Esc` | Cancel an in-flight polygon draw |
 | `Enter` | Finish the current polygon and open the form dialog |
 
-Product key map: **1**=REF • **2**=VEL • **3**=SW • **4**=CC • **5**=ZDR • **6**=KDP • **7**=PHI
+Product key map: **1**=REF • **2**=VEL • **3**=SW • **4**=CC • **5**=ZDR • **6**=PHI
+
+KDP (specific differential phase) was intentionally dropped — PyART's NEXRAD reader doesn't compute it directly, and the on-demand retrieval (`pyart.retrieve.kdp_vulpiani`) takes ~4 s per WSR-88D volume even in the preload pool, which is too slow to keep up with scrubbing. Raw differential phase (PHI) is exposed instead for users who want to see the underlying phase signal.
 
 ---
 

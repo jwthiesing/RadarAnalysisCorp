@@ -196,8 +196,19 @@ class MotionTool(QObject):
             self.error.emit("Scrub time forward (← →) before clicking point 2.")
             return
         p2 = point
-        items = list(self._inprogress_items)
-        items.append(self._draw_marker(view, p2[0], p2[1]))
+        # Drop the construction-only click-point dots once a track is
+        # committed — the arrow + speed/direction label IS the
+        # measurement, the bare dots add visual noise. The arrow's
+        # head sits exactly on P2 and its tail on P1 so the
+        # endpoints are still readable. Track ``items`` only keeps
+        # the visible-result artists so right-click delete still
+        # removes everything together.
+        for inprog in self._inprogress_items:
+            try:
+                self._p1_view.removeItem(inprog)
+            except (RuntimeError, AttributeError):
+                pass
+        items: list = []
         motion_obj = self._compute_motion(self._p1, p2)
         items.extend(self._draw_arrow_and_label(view, self._p1, p2, motion_obj))
         items.extend(self._draw_forecast_track(view, self._p1, p2))

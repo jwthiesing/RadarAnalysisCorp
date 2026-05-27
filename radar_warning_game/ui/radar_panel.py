@@ -2,8 +2,11 @@
 
 A :class:`RadarPanelGrid` widget holds 1, 2, or 4 :class:`RadarPanel`
 instances, each showing the same radar volume at the same elevation/time
-but a different product (REF / VEL / CC / ZDR / KDP / SW). Pan and zoom
+but a different product (REF / VEL / SW / CC / ZDR / PHI). Pan and zoom
 are synchronized across the panels via their pyqtgraph view ranges.
+KDP isn't included — its range-derivative retrieval is too slow to
+keep up with scrubbing; raw differential phase (PHI) is exposed
+instead for users who want to see the underlying phase signal.
 
 Built on **pyqtgraph**. The radar sweep is rasterized once per render
 from polar (azimuth, range) → Cartesian (x_km, y_km) via numpy ufuncs
@@ -26,7 +29,7 @@ elevation, only the *product* is per-panel):
   ``↑`` / ``↓``      next / previous elevation tilt
   ``←`` / ``→``      previous / next sweep at current elevation (SAILS-aware)
   ``Shift+←/→``      step 5 sweeps
-  ``1``…``7``        change focused panel's product (REF/VEL/CC/ZDR/KDP/HCA/SW)
+  ``1``…``6``        change focused panel's product (REF/VEL/SW/CC/ZDR/PHI)
   ``W A S D``        pan view (north / west / south / east)
   ``=`` / ``-``      zoom in / out
   Mouse drag         pan
@@ -111,13 +114,21 @@ class DealiasMode(str, Enum):
 
 # Product → (PyART field name, colormap name, vmin, vmax) in m/s for velocity.
 # Velocity field name is replaced at render time if dealiasing is active.
+#
+# KDP (specific_differential_phase) is intentionally NOT here: PyART's
+# NEXRAD reader doesn't produce the range-derivative directly, and the
+# retrieval (e.g. ``pyart.retrieve.kdp_vulpiani``) takes ~4 s per
+# WSR-88D volume — too slow even when run in the preload pool, since
+# every prefetched volume would pay that cost. We expose the raw
+# differential-phase field (PHI) so users who want phase information
+# can still see it; KDP can be added later if a faster retrieval
+# becomes available.
 PRODUCTS: dict[str, tuple[str, str, float, float]] = {
     "REF": ("reflectivity",                "ChaseSpectral", -10.0, 75.0),
     "VEL": ("velocity",                    "Carbone42",     -40.0, 40.0),
     "SW":  ("spectrum_width",              "magma",           0.0, 15.0),
     "CC":  ("cross_correlation_ratio",     "NWSRef",          0.0,  1.0),
     "ZDR": ("differential_reflectivity",   "ChaseSpectral",   0.0,  7.5),
-    "KDP": ("specific_differential_phase", "ChaseSpectral",   0.0,  7.5),
     "PHI": ("differential_phase",          "Wild25",          0.0, 360.0),
 }
 
@@ -125,7 +136,7 @@ PRODUCTS: dict[str, tuple[str, str, float, float]] = {
 # differential phase, CC the cross-correlation ratio (unitless).
 PRODUCT_UNITS: dict[str, str] = {
     "REF": "dBZ", "VEL": "m/s", "SW": "m/s",
-    "CC":  "",    "ZDR": "dB",  "KDP": "°/km", "PHI": "°",
+    "CC":  "",    "ZDR": "dB",  "PHI": "°",
 }
 
 CORRECTED_VELOCITY_FIELD = "corrected_velocity"
@@ -818,6 +829,12 @@ class RadarPanel(QFrame):
     def __init__(self, product: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.product = product
+        # User-tunable velocity range (m/s). The colormap is symmetric so
+        # we just store the half-range — vmin = -vel_vmax, vmax =
+        # +vel_vmax. Defaults to PRODUCTS["VEL"]'s 40 m/s but the grid
+        # can override per-instance via :meth:`set_vel_range`. Doesn't
+        # affect other products' fixed PRODUCTS entries.
+        self._vel_vmax: float = float(PRODUCTS["VEL"][3])
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
@@ -1106,10 +1123,15 @@ class RadarPanel(QFrame):
         :meth:`commit_sweep_render` applies the rasterizer output and
         finalizes the panel."""
         field, cmap_name, vmin, vmax = PRODUCTS[self.product]
-        if self.product == "VEL" and velocity_field is not None:
-            field = velocity_field
-            if field not in radar.fields and "velocity" in radar.fields:
-                field = "velocity"
+        if self.product == "VEL":
+            # Override the static PRODUCTS range with the panel's
+            # user-tunable ±vel_vmax — the colormap is symmetric so
+            # one half-range value fully describes it.
+            vmin, vmax = -self._vel_vmax, self._vel_vmax
+            if velocity_field is not None:
+                field = velocity_field
+                if field not in radar.fields and "velocity" in radar.fields:
+                    field = "velocity"
         elev = float(radar.fixed_angle["data"][sweep_no])
         base_title = (f"{site.icao}  {self.product}  {elev:.1f}°   "
                       f"{format_player_time(display_time)}")
@@ -1562,9 +1584,14 @@ class RadarPanel(QFrame):
         PDS_COLOR = "#ff66cc"
         MCD_COLOR = "#3399ff"
         TORE_PINK = "#ff66cc"
+        # Per-tier line widths (px). Doubled from the original
+        # 1.5-3.0 px set so warning polygons read more clearly against
+        # dense radar imagery — at typical zoom-in levels the thinner
+        # lines were hard to spot under heavy reflectivity / velocity
+        # gradients.
         TIER_LW = {
-            "SVR": 1.5, "SVRC": 2.0, "SVRD": 2.6,
-            "TOR": 1.5, "TORR": 1.8, "PDS_TOR": 2.4, "TORE": 3.0,
+            "SVR": 3.0, "SVRC": 4.0, "SVRD": 5.2,
+            "TOR": 3.0, "TORR": 3.6, "PDS_TOR": 4.8, "TORE": 6.0,
         }
         ref_time = game_clock_time if game_clock_time is not None else display_time
         for w in warnings:
@@ -1652,7 +1679,9 @@ class RadarPanel(QFrame):
             for i, (lat, lon) in enumerate(verts):
                 x_km, y_km = latlon_to_xy_km(lat, lon, site.lat, site.lon)
                 xs[i] = x_km; ys[i] = y_km
-            pen = pg.mkPen(color=MCD_COLOR, width=1.4, style=Qt.PenStyle.DotLine)
+            # 2× the original 1.4 px for visual parity with the
+            # thicker warning lines.
+            pen = pg.mkPen(color=MCD_COLOR, width=2.8, style=Qt.PenStyle.DotLine)
             item = pg.PlotCurveItem(xs, ys, pen=pen)
             item.setZValue(8)
             mcd_id = getattr(m, "mcd_id", None)
@@ -2202,6 +2231,33 @@ class RadarPanelGrid(QWidget):
             lambda _i: self.set_dealias_mode(self._dealias_combo.currentData())
         )
         h.addWidget(self._dealias_combo)
+        h.addSpacing(10)
+
+        # VEL ± range — symmetric vmax for the velocity colormap.
+        # Defaults to whatever PRODUCTS["VEL"] says (40 m/s) so we
+        # don't break the visual baseline; host can stretch or
+        # compress to match the day.
+        h.addWidget(QLabel("VEL ±:", bar))
+        from PyQt6.QtWidgets import QDoubleSpinBox
+        self._vel_range_spin = QDoubleSpinBox(bar)
+        self._vel_range_spin.setRange(5.0, 150.0)
+        self._vel_range_spin.setSingleStep(5.0)
+        self._vel_range_spin.setDecimals(0)
+        self._vel_range_spin.setSuffix(" m/s")
+        self._vel_range_spin.setValue(
+            float(self._panels[0]._vel_vmax) if self._panels
+            else float(PRODUCTS["VEL"][3])
+        )
+        self._vel_range_spin.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._vel_range_spin.setToolTip(
+            "Symmetric ± range for the velocity color scale. Default "
+            "±40 m/s suits most ordinary storms; raise to ±80+ when "
+            "tracking violent rotation / strong shear so deep reds "
+            "and greens don't saturate. Affects ALL VEL panels in "
+            "the grid simultaneously."
+        )
+        self._vel_range_spin.valueChanged.connect(self.set_vel_range)
+        h.addWidget(self._vel_range_spin)
         h.addStretch(1)
 
         outer = self.layout()
@@ -2260,6 +2316,26 @@ class RadarPanelGrid(QWidget):
     @property
     def dealias_mode(self) -> DealiasMode:
         return self._dealias_mode
+
+    def set_vel_range(self, vmax_ms: float) -> None:
+        """Set the symmetric ±velocity colormap range (m/s) on every
+        panel and trigger a re-render. Used by the toolbar's "VEL ±"
+        spinbox so the host can stretch / compress the velocity color
+        scale to match the day's flow — default ±40 m/s works for most
+        garden-variety storms, but a derecho or strong tornado needs
+        ±80+ to keep the deep reds/greens from saturating, while a
+        weak-shear day looks washed out at ±40 and benefits from
+        narrowing to ±20."""
+        vmax_ms = float(max(1.0, min(150.0, vmax_ms)))
+        for panel in self._panels:
+            panel._vel_vmax = vmax_ms
+        # Re-render only if a VEL panel actually exists in the current
+        # layout — otherwise the new range value just sits ready for
+        # the next time the user switches a panel to VEL.
+        if self._current_radar is not None and any(
+            p.product == "VEL" for p in self._panels
+        ):
+            self._render_all()
 
     def set_dealias_mode(self, mode: DealiasMode) -> None:
         if mode == self._dealias_mode:

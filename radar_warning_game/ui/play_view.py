@@ -95,7 +95,7 @@ class PlayView(QWidget):
             raise RuntimeError("PlayView needs at least one radar site")
         initial_site = sites[0]
         # TDWRs are single-pol C-band — Unidata's Level 2 files only carry
-        # REF / VEL / SW (no CC, ZDR, KDP, PHI). Default-laying-out four
+        # REF / VEL / SW (no CC, ZDR, PHI). Default-laying-out four
         # panels with two of them dual-pol would leave the host staring
         # at two permanently-blank panels every render, which reads as
         # "the panels aren't rendering" even though REF/VEL are fine.
@@ -266,9 +266,10 @@ class PlayView(QWidget):
         QShortcut(QKeySequence("Alt+4"), self,
                    activated=lambda: self.radar_grid.set_layout(4))
         # Product cycling on the focused panel — same key-to-product map as
-        # PRODUCTS dict ordering: 1=REF, 2=VEL, 3=SW, 4=CC, 5=ZDR, 6=KDP, 7=PHI.
+        # PRODUCTS dict ordering: 1=REF, 2=VEL, 3=SW, 4=CC, 5=ZDR, 6=PHI.
         # Click a panel to focus it before pressing the digit.
-        for i, key in enumerate(("1", "2", "3", "4", "5", "6", "7")):
+        # (KDP used to be 6 but was dropped — its retrieval is too slow.)
+        for i, key in enumerate(("1", "2", "3", "4", "5", "6")):
             QShortcut(QKeySequence(key), self,
                        activated=lambda idx=i: self.radar_grid._cycle_focused_product(idx))
         # Keyboard zoom (center-of-view). Scroll-wheel zoom still works but
@@ -502,6 +503,16 @@ class PlayView(QWidget):
         """
         if not self.radar_grid._panels:
             return
+        # If the storm-motion tool is currently listening, deactivate
+        # it before we start drawing. Both tools subscribe to the
+        # panel scenes' ``sigMouseClicked``; if motion-tool stays
+        # active, every polygon-vertex click ALSO drops a motion-tool
+        # P2 (or sets a stray P1 if it had none), which manifests as
+        # "my warning placement is putting a point at where my last
+        # motion-tool click was." Cleaner UX: starting a polygon
+        # cancels any in-flight motion measurement.
+        if self.motion_tool.is_active:
+            self._toggle_motion_tool()
         site = self.radar_grid.site
         from ..geo.projection import xy_km_to_latlon
         views = [p.view for p in self.radar_grid._panels]
@@ -531,7 +542,11 @@ class PlayView(QWidget):
         """Esc handler — clear in-flight polygon and reset the cursor / status."""
         if self._active_poly_editor is None:
             return
-        self._active_poly_editor.clear()
+        # ``dispose`` removes the outline + marker artists from every
+        # panel's scene (vs ``clear`` which only empties their data).
+        # Necessary so a re-render of the panel can't paint stale
+        # vertices back in from a leftover Qt-internal cache.
+        self._active_poly_editor.dispose()
         self._active_poly_editor = None
         self._pending_action = None
         self._restore_default_cursor()
@@ -599,7 +614,12 @@ class PlayView(QWidget):
                 self._push_player_overlays()
                 if self.host_map is not None:
                     self.host_map.refresh()
-        editor.clear()
+        # Permanently remove the in-progress editor's vertex markers +
+        # outline from every panel's scene. ``clear()`` only empties
+        # their data; ``dispose()`` detaches them outright so leftover
+        # Qt items can't flash content back in next time the user
+        # starts another draw.
+        editor.dispose()
 
     def _on_warning_clicked(self, warning_id: str) -> None:
         """Open the revise dialog for an own warning the user clicked.
@@ -636,9 +656,39 @@ class PlayView(QWidget):
         if ref > target.end_time():
             log.info("warning %s expired — not opening revise dialog", warning_id)
             return
-        dlg = WarningFormDialog(existing=target, parent=self)
+        # Pass the current game-clock time so the dialog can prefill
+        # the duration field with "minutes remaining until current
+        # expiry" — a no-change revise will then preserve the
+        # original expiry instead of inadvertently extending it by
+        # the time elapsed since issuance.
+        now = self.session.clock.virtual_time if self.session.clock else None
+        dlg = WarningFormDialog(existing=target, now=now, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+        # The user can pick between two destructive options from the
+        # dialog: Cancel-this-warning (which permanently terminates
+        # the warning at the current clock time) or Revise (which
+        # appends a new revision). The dialog flags the former via
+        # ``cancel_requested()``.
+        if dlg.cancel_requested():
+            if self.multiplayer is not None:
+                asyncio.ensure_future(self.multiplayer.cancel_warning(
+                    warning_id=warning_id, player_id=self.local_player_id,
+                ))
+            else:
+                self.session.cancel_warning(
+                    warning_id=warning_id, player_id=self.local_player_id,
+                )
+                if self._replay is not None and self.session.clock:
+                    self._replay.log_warning_cancel(
+                        warning_id, self.local_player_id,
+                        virtual_time=self.session.clock.virtual_time,
+                    )
+            self._push_player_overlays()
+            if self.host_map is not None:
+                self.host_map.refresh()
+            return
+
         params = dlg.get_parameters()
         # ``params`` carries warning_type, duration, magnitudes — exactly
         # the kwargs ``revise_warning`` overlays onto the prior revision
@@ -692,6 +742,13 @@ class PlayView(QWidget):
             btn.blockSignals(False)
 
     def _toggle_motion_tool(self) -> None:
+        # Motion-tool and polygon-draw both consume scene-level clicks.
+        # If a polygon draw is in flight when the user toggles motion
+        # on, cancel the draw first — otherwise every motion-tool
+        # click would ALSO add a polygon vertex.
+        if (not self.motion_tool.is_active
+                and self._active_poly_editor is not None):
+            self._cancel_polygon_draw()
         if self.motion_tool.is_active:
             # Stop listening for new clicks; existing tracks remain drawn
             # until the player right-clicks them.

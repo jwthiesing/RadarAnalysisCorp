@@ -22,6 +22,7 @@ from ..data.reports import (
     count_by_category,
     fetch_reports,
     get_daily_counts,
+    peak_tornado_ef,
 )
 
 # Date range bounds (plan locked decision)
@@ -33,18 +34,42 @@ MAX_RANDOM_TRIES = 200
 
 @dataclass(frozen=True)
 class ThresholdSpec:
-    """Minimum report counts the picked day must meet."""
+    """Minimum thresholds the picked day must meet.
+
+    ``min_tornadoes`` / ``min_hail`` / ``min_wind`` are simple count
+    floors. ``min_strongest_tornado_ef`` filters by the day's *peak*
+    confirmed tornado EF — useful for "give me a day with at least one
+    EF3+" picks. The peak EF is sourced post-SVRGIS-backfill, so
+    older events (>180 days) use the NWS-survey-confirmed rating
+    rather than the often-unset IEM preliminary value. A value of
+    ``-1.0`` (default) is "no EF constraint" — any tornado activity
+    that satisfies the count floor passes.
+    """
 
     min_tornadoes: int = 0
     min_hail: int = 0
     min_wind: int = 0
+    min_strongest_tornado_ef: float = -1.0
 
-    def is_met(self, counts: dict[str, int]) -> bool:
-        return (
-            counts.get("tornado", 0) >= self.min_tornadoes
-            and counts.get("hail", 0) >= self.min_hail
-            and counts.get("wind", 0) >= self.min_wind
-        )
+    def is_met(self, counts: dict) -> bool:
+        if counts.get("tornado", 0) < self.min_tornadoes:
+            return False
+        if counts.get("hail", 0) < self.min_hail:
+            return False
+        if counts.get("wind", 0) < self.min_wind:
+            return False
+        if self.min_strongest_tornado_ef >= 0.0:
+            # ``peak_ef`` is the day's strongest confirmed tornado EF
+            # (or -1.0 if no rated tornado occurred). Days for which
+            # we haven't yet recorded a post-SVRGIS peak EF (legacy
+            # cache entries, very-recent days) report ``None``; we
+            # fail the gate in that case so the picker falls through
+            # to a fresh fetch + re-record. After that one round-trip
+            # the cache is current and subsequent picks short-circuit.
+            peak = counts.get("peak_ef")
+            if peak is None or float(peak) < self.min_strongest_tornado_ef:
+                return False
+        return True
 
 
 @dataclass
@@ -79,12 +104,57 @@ def pick_specific_day(day_12z_date: datetime) -> RoundDay:
         day_12z_date = day_12z_date.replace(tzinfo=timezone.utc)
     start, end = _convective_day_bounds(day_12z_date)
     reports = fetch_reports(start, end)
+    counts: dict = dict(count_by_category(reports))
+    # Pack the day's strongest confirmed tornado EF into the counts
+    # dict so ``ThresholdSpec.is_met`` can apply its EF floor on a
+    # freshly-fetched day (same as the cached-counts short-circuit).
+    counts["peak_ef"] = peak_tornado_ef(reports)
     return RoundDay(
         convective_day_12z=start,
         reports=reports,
-        counts=count_by_category(reports),
+        counts=counts,
         is_random=False,
     )
+
+
+def _candidate_days(
+    spec: ThresholdSpec,
+    range_start: datetime,
+    range_end: datetime,
+) -> list[datetime] | None:
+    """Build the list of dates to sample from.
+
+    When ``spec`` carries a tornado-EF floor, we restrict the random
+    pool to SVRGIS days that actually contain a tornado at that EF —
+    a 70 k-row CSV filter is instant and avoids the wasteful
+    "sample uniformly + reject" pattern. For EF4+ that's ~50 days
+    across the full archive; an unguided uniform-over-9000-days
+    sampler would burn dozens of IEM HTTP round-trips to land on
+    even one.
+
+    Returns ``None`` when the EF floor is unset (caller falls back to
+    the uniform sampler) or when SVRGIS load fails (also uniform-
+    sampler fallback)."""
+    if spec.min_strongest_tornado_ef < 0:
+        return None
+    try:
+        from ..data.spc_svrgis import convective_days_with_min_ef
+        days = convective_days_with_min_ef(
+            spec.min_strongest_tornado_ef,
+            range_start=range_start,
+            range_end=range_end,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[round_builder] SVRGIS candidate-day lookup failed: {e}")
+        return None
+    if not days:
+        # Either no days match (very high threshold + small archive)
+        # or SVRGIS just returned empty. Either way returning None
+        # falls back to the date-range sampler, which will explore
+        # the recent (post-publication-lag) days that SVRGIS hasn't
+        # ingested yet.
+        return None
+    return days
 
 
 def pick_random_day(
@@ -98,6 +168,19 @@ def pick_random_day(
 ) -> RoundDay:
     """Sample 12Z convective days until one meets ``spec``.
 
+    Sampling strategy depends on whether a tornado-EF floor is set:
+
+      - **EF floor unset** (default): uniform random sample over
+        ``[range_start, range_end]``. The daily-counts cache lets us
+        short-circuit known-non-qualifying days, but unfamiliar days
+        still pay a network fetch.
+      - **EF floor set** (``min_strongest_tornado_ef >= 0``): sample
+        from the SVRGIS-derived list of convective days that contain
+        at least one tornado at the requested EF. Filtering 70 k
+        SVRGIS rows is instant; this collapses "explore 9 000 days
+        looking for ~50 EF4+ days" into one O(1) pick from a 50-entry
+        list, no wasted HTTP round-trips.
+
     Raises ``RuntimeError`` after ``max_tries`` if no qualifying day was found —
     typically means the thresholds are unrealistically high.
     """
@@ -107,14 +190,35 @@ def pick_random_day(
     if range_end <= range_start:
         raise ValueError("Effective date range is empty (range_start ≥ range_end)")
     total_days = (range_end - range_start).days
+
+    # If an EF floor is set, build a pre-filtered candidate-day list
+    # from SVRGIS. Falls back to uniform sampling when SVRGIS is
+    # unavailable or the floor wasn't requested.
+    candidate_days = _candidate_days(spec, range_start, range_end)
+    if candidate_days is not None:
+        print(f"[round_builder] EF floor "
+              f"{spec.min_strongest_tornado_ef:.0f}+ → "
+              f"{len(candidate_days)} SVRGIS-qualified candidate days")
+
     # The daily-counts index lets us skip non-qualifying days without a fresh
     # network round-trip per attempt. For days we've never indexed we still
     # fetch (which is what populates the index).
     seen_keys: set[str] = set()
     for _ in range(max_tries):
-        offset = rng.randint(0, total_days)
-        candidate = range_start + timedelta(days=offset)
-        candidate = candidate.replace(hour=12, minute=0, second=0, microsecond=0)
+        if candidate_days is not None:
+            # SVRGIS-driven path: pick from the pre-filtered list. Once
+            # every day's been tried, stop — there's nothing more to
+            # explore.
+            unseen = [d for d in candidate_days
+                      if d.strftime("%Y-%m-%d") not in seen_keys]
+            if not unseen:
+                break
+            candidate = rng.choice(unseen)
+        else:
+            # Uniform-sample path (no EF floor).
+            offset = rng.randint(0, total_days)
+            candidate = range_start + timedelta(days=offset)
+            candidate = candidate.replace(hour=12, minute=0, second=0, microsecond=0)
         key = candidate.strftime("%Y-%m-%d")
         if key in seen_keys:
             continue

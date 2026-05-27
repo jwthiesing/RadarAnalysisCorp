@@ -234,3 +234,60 @@ def casualties_from_svrgis(row: "pd.Series") -> tuple[int, int]:
         except (TypeError, ValueError):
             return 0
     return _int(row.get("inj", 0)), _int(row.get("fat", 0))
+
+
+def _convective_day_12z(utc_dt: "pd.Timestamp") -> "pd.Timestamp":
+    """Project a UTC tornado time onto the 12Z–12Z convective day it
+    belongs to. A tornado at 03:14 UTC on 2013-05-21 is part of the
+    2013-05-20 convective day; one at 19:56 UTC on 2013-05-20 is also
+    on 2013-05-20."""
+    shifted = utc_dt - pd.Timedelta(hours=12)
+    return pd.Timestamp(shifted.year, shifted.month, shifted.day, 12)
+
+
+def convective_days_with_min_ef(
+    min_ef: float,
+    *,
+    range_start: datetime | None = None,
+    range_end: datetime | None = None,
+) -> list[datetime]:
+    """Return the sorted list of UTC 12Z timestamps for every convective
+    day in ``[range_start, range_end]`` that contains at least one
+    SVRGIS tornado with ``mag >= min_ef``.
+
+    This is the SVRGIS-driven equivalent of "sample random dates from
+    2000-today until one has an EF4+ tornado." For ``min_ef=4`` there
+    are roughly 50 such days over the full archive, so the random-
+    pick becomes one O(1) selection from a 50-entry list instead of
+    hundreds of HTTP round-trips against IEM hoping to land on a
+    qualifying day.
+
+    Returns an empty list if SVRGIS is unavailable (caller should
+    fall back to the date-range random-sample approach)."""
+    try:
+        df = load_svrgis()
+    except Exception:
+        log.exception("SVRGIS unavailable — no candidate days returned")
+        return []
+    qualifying = df[df["mag"] >= min_ef]
+    if qualifying.empty:
+        return []
+    # Project each tornado's UTC time onto its convective 12Z day.
+    days = qualifying["utc_dt"].apply(_convective_day_12z)
+    # Apply optional date-window filter (in NAIVE-UTC space because
+    # ``utc_dt`` itself is naive — see load_svrgis).
+    if range_start is not None:
+        rs = range_start.replace(tzinfo=None) if range_start.tzinfo else range_start
+        days = days[days >= pd.Timestamp(rs)]
+    if range_end is not None:
+        re_ = range_end.replace(tzinfo=None) if range_end.tzinfo else range_end
+        days = days[days <= pd.Timestamp(re_)]
+    if days.empty:
+        return []
+    # Deduplicate (one tornado per day is enough to qualify the day)
+    # and convert back to aware UTC datetimes for caller ergonomics.
+    unique_naive = sorted(set(days.tolist()))
+    return [
+        d.to_pydatetime().replace(tzinfo=timezone.utc)
+        for d in unique_naive
+    ]

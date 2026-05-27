@@ -65,9 +65,13 @@ def _save_daily_counts(counts: dict[str, dict[str, int]]) -> None:
         pass
 
 
-def get_daily_counts(day_12z: datetime) -> dict[str, int] | None:
+def get_daily_counts(day_12z: datetime) -> dict | None:
     """Return cached counts for the convective day starting at ``day_12z``, or
-    ``None`` if we've never indexed it. Safe to call without network access.
+    ``None`` if we've never indexed it. The returned dict has at least
+    ``tornado / hail / wind`` integer keys, and optionally ``peak_ef``
+    (float — the day's strongest confirmed tornado EF, ``-1.0`` if no
+    rated tornado, missing entirely for legacy entries that predated
+    the EF-threshold feature). Safe to call without network access.
     """
     if day_12z.tzinfo is None:
         day_12z = day_12z.replace(tzinfo=timezone.utc)
@@ -75,14 +79,53 @@ def get_daily_counts(day_12z: datetime) -> dict[str, int] | None:
     return _load_daily_counts().get(key)
 
 
-def _record_daily_counts(day_12z: datetime, counts: dict[str, int]) -> None:
-    """Persist a day's category counts into the lightweight index."""
+def _record_daily_counts(
+    day_12z: datetime,
+    counts: dict[str, int],
+    *,
+    peak_ef: float | None = None,
+) -> None:
+    """Persist a day's category counts (and optionally the peak
+    confirmed tornado EF) into the lightweight index. Passing
+    ``peak_ef=None`` leaves any existing recorded peak_ef in place —
+    that way the IEM-only initial recording doesn't clobber a
+    post-SVRGIS update done by the second-pass recorder."""
     if day_12z.tzinfo is None:
         day_12z = day_12z.replace(tzinfo=timezone.utc)
     key = day_12z.strftime("%Y-%m-%d")
     all_counts = _load_daily_counts()
-    all_counts[key] = {k: int(counts.get(k, 0)) for k in ("tornado", "hail", "wind")}
+    entry: dict = {k: int(counts.get(k, 0)) for k in ("tornado", "hail", "wind")}
+    # Preserve a previously-recorded peak_ef if the current call
+    # didn't supply one (e.g. fetch_iem_window can't compute the
+    # post-SVRGIS peak; only fetch_reports can).
+    existing = all_counts.get(key, {})
+    if peak_ef is not None:
+        entry["peak_ef"] = float(peak_ef)
+    elif "peak_ef" in existing:
+        entry["peak_ef"] = existing["peak_ef"]
+    all_counts[key] = entry
     _save_daily_counts(all_counts)
+
+
+def peak_tornado_ef(reports: list["Report"]) -> float:
+    """Public alias of :func:`_peak_tornado_ef`. Used by callers that
+    need to enrich a fresh ``count_by_category`` dict with the day's
+    strongest tornado EF for the ``ThresholdSpec.is_met`` gate."""
+    return _peak_tornado_ef(reports)
+
+
+def _peak_tornado_ef(reports: list["Report"]) -> float:
+    """Day's strongest *rated* tornado EF. Returns ``-1.0`` if no
+    tornado was rated (either no tornadoes at all or only unrated /
+    preliminary records). Used by the random-day picker's
+    ``min_strongest_tornado_ef`` threshold."""
+    peak = -1.0
+    for r in reports:
+        if r.category != "tornado":
+            continue
+        if r.magnitude > peak:
+            peak = float(r.magnitude)
+    return peak
 
 # IEM TYPECODE → category
 TORNADO_CODES = frozenset({"T"})
@@ -289,7 +332,26 @@ def fetch_reports(
     informative, but a SVRGIS row marked unrated (``mag = -9``) leaves
     the IEM value alone."""
     iem = fetch_iem_window(start, end)
+
+    def _record_post_backfill_peak(reports: list[Report]) -> None:
+        """Re-record the daily-counts entry with the *post-backfill*
+        counts AND the peak confirmed tornado EF, so the random-day
+        picker's ``min_strongest_tornado_ef`` threshold can short-
+        circuit future visits to this day from cache."""
+        if start.hour == 12:
+            _record_daily_counts(
+                start, count_by_category(reports),
+                peak_ef=_peak_tornado_ef(reports),
+            )
+
     if not use_spc_backfill or not _should_backfill_with_spc(start, today):
+        # No backfill is going to fire, but we can still record the
+        # peak EF from the IEM-only data so the EF threshold can
+        # short-circuit on this day. For events <30 days old the
+        # IEM EF is preliminary / often unset, so the peak will be
+        # close to -1.0 — that's fine; the random-day picker's date
+        # range starts at 2000, so very-recent days are unusual.
+        _record_post_backfill_peak(iem)
         return iem
     # ---- Step 1: SVRGIS backfill for tornadoes (preferred) ----
     iem = _backfill_with_svrgis(
@@ -301,8 +363,10 @@ def fetch_reports(
         spc_df = fetch_spc_tornadoes_day(start)
     except Exception as e:  # noqa: BLE001
         print(f"[warn] SPC backfill fetch failed for {start:%Y-%m-%d}: {e}")
+        _record_post_backfill_peak(iem)
         return iem
     if spc_df.empty:
+        _record_post_backfill_peak(iem)
         return iem
     out = []
     for r in iem:
@@ -319,6 +383,7 @@ def fetch_reports(
             out.append(r)
             continue
         out.append(_merge_spc_into_iem(r, match))
+    _record_post_backfill_peak(out)
     return out
 
 

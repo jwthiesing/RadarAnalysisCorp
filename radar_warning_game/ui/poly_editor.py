@@ -151,6 +151,34 @@ class PolygonEditor(QObject):
         self._refresh_artists()
         self.polygon_changed.emit(None)
 
+    def dispose(self) -> None:
+        """Remove every outline + marker artist from every view's scene
+        and forget them. Use this when the editor is permanently done
+        (e.g. user finished or canceled a draw) — ``clear()`` only
+        empties the data on the existing artists, which leaves them
+        attached to the scenes. If a subsequent action then re-uses
+        the same artist instances (or a child item type that pyqtgraph
+        re-paints), the cleared-but-still-attached artists can flicker
+        previous content back into view. ``dispose()`` makes the
+        cleanup hermetic — after this call the editor is dead, do not
+        use it further."""
+        # Empty data first (defensive against any held reference).
+        self._vertices.clear()
+        for v, outline in zip(self.views, self._outlines):
+            try:
+                if outline.scene() is v.scene():
+                    v.removeItem(outline)
+            except (RuntimeError, AttributeError):
+                pass
+        for v, markers in zip(self.views, self._markers_items):
+            try:
+                if markers.scene() is v.scene():
+                    v.removeItem(markers)
+            except (RuntimeError, AttributeError):
+                pass
+        self._outlines.clear()
+        self._markers_items.clear()
+
     def set_polygon(
         self,
         polygon: Polygon,

@@ -13,7 +13,7 @@ drawing — only fields change.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -101,12 +101,24 @@ class WarningFormDialog(QDialog):
         self,
         *,
         existing: Warning | None = None,
+        now: "datetime | None" = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Revise Warning" if existing else "Issue Warning")
         self.setModal(True)
         self._existing = existing
+        # ``now`` is the current game-clock time, used when revising so
+        # the duration field can be prefilled with "minutes remaining
+        # until the current expiry." Without it, the old prefill of
+        # ``current_revision.duration`` had the duration meaning
+        # "from-issue" while ``revise_warning`` interprets the new
+        # revision's duration as "from-revision-time" — so a
+        # no-change revise actually extended the warning by the
+        # elapsed time since issuance. Passing ``now`` lets us
+        # prefill so "no change" really is no change.
+        self._now = now
+        self._cancel_requested = False
 
         # Family picker — base warning category (Severe Thunderstorm or
         # Tornado). The IBW "tag" (Considerable, Destructive, PDS, Emergency,
@@ -182,6 +194,29 @@ class WarningFormDialog(QDialog):
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        # Cancel-warning button (revise mode only) — issues a
+        # WarningCancel rather than a revision. Surfaced via the
+        # dialog's ``cancel_requested()`` flag so the caller can
+        # route to the right session method.
+        self._cancel_warning_btn: "QPushButton | None" = None
+        if existing is not None:
+            from PyQt6.QtWidgets import QPushButton
+            self._cancel_warning_btn = QPushButton("Cancel This Warning", self)
+            self._cancel_warning_btn.setStyleSheet(
+                "QPushButton { color: #ff6060; font-weight: bold; }"
+                " QPushButton:hover { background-color: rgba(255, 60, 60, 0.10); }"
+            )
+            self._cancel_warning_btn.setToolTip(
+                "Permanently cancel this warning at the current game time. "
+                "No reports after the cancel time will verify it. Cannot be undone."
+            )
+            self._cancel_warning_btn.clicked.connect(self._on_cancel_warning_clicked)
+            # Slot into the QDialogButtonBox so it sits inline with
+            # the Revise / Cancel(close-dialog) pair.
+            buttons.addButton(
+                self._cancel_warning_btn,
+                QDialogButtonBox.ButtonRole.DestructiveRole,
+            )
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
@@ -202,7 +237,27 @@ class WarningFormDialog(QDialog):
             t_idx = self._tag_combo.findData(tag)
             if t_idx >= 0:
                 self._tag_combo.setCurrentIndex(t_idx)
-            self._duration_spin.setValue(int(cur.duration.total_seconds() // 60))
+            # Duration prefill: minutes from "now" (game-clock time)
+            # until the warning's current expiry. ``session.revise_warning``
+            # uses the new revision's duration as the time-from-revision-
+            # until-expiry, and stamps the revision_time at the current
+            # clock — so this prefill makes a no-change revise preserve
+            # the existing expiry. Falls back to the raw current-
+            # revision duration when ``now`` wasn't provided (e.g.
+            # tests construct the dialog directly without the clock).
+            if self._now is not None:
+                remaining = (existing.end_time() - self._now).total_seconds() / 60.0
+                # Clamp to the spinbox's range; a negative remaining
+                # (already-expired warning) is a degenerate case but
+                # we let the user pick a new positive duration to
+                # effectively re-activate it.
+                prefilled = max(
+                    self._duration_spin.minimum(),
+                    min(self._duration_spin.maximum(), int(round(remaining))),
+                )
+                self._duration_spin.setValue(prefilled)
+            else:
+                self._duration_spin.setValue(int(cur.duration.total_seconds() // 60))
             # None → land on the "(no hail tag)" / "(no wind tag)" sentinel
             # so editing an existing warning shows what it really claims.
             if cur.magnitudes.hail_in is not None:
@@ -285,6 +340,19 @@ class WarningFormDialog(QDialog):
                 return wt
         # Fall back to the base type for the chosen family.
         return tags[0][2]
+
+    def _on_cancel_warning_clicked(self) -> None:
+        """Cancel-warning button handler — flag the request and accept
+        the dialog so the caller's normal Accepted branch can route to
+        ``cancel_warning(...)`` instead of ``revise_warning(...)``."""
+        self._cancel_requested = True
+        self.accept()
+
+    def cancel_requested(self) -> bool:
+        """``True`` iff the user clicked 'Cancel This Warning' rather
+        than the Revise / Issue button. Caller branches on this after
+        ``exec()`` returns Accepted."""
+        return self._cancel_requested
 
     def get_parameters(self) -> dict:
         """Return kwargs ready to pass to :meth:`GameSession.issue_warning`.

@@ -12,6 +12,7 @@ from datetime import date, datetime, timezone
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDateEdit,
     QDialog,
     QDialogButtonBox,
@@ -49,6 +50,30 @@ class DayPickerDialog(QDialog):
         self._tor_spin = QSpinBox(self); self._tor_spin.setRange(0, 200); self._tor_spin.setValue(5)
         self._hail_spin = QSpinBox(self); self._hail_spin.setRange(0, 500); self._hail_spin.setValue(20)
         self._wind_spin = QSpinBox(self); self._wind_spin.setRange(0, 500); self._wind_spin.setValue(20)
+        # Optional EF floor — picks days where at least one tornado
+        # was rated ≥ the selected EF after damage survey. Powered by
+        # the SVRGIS post-survey EF (see data/spc_svrgis.py); for
+        # pre-180-day events SVRGIS hasn't been published yet and the
+        # threshold falls back to whatever EF IEM happens to record
+        # (usually unset for preliminary data).
+        self._min_ef_combo = QComboBox(self)
+        # Pairs are (display, ThresholdSpec.min_strongest_tornado_ef value)
+        for label, value in (
+            ("Any (no EF constraint)", -1.0),
+            ("EF1+", 1.0),
+            ("EF2+ (significant)", 2.0),
+            ("EF3+", 3.0),
+            ("EF4+", 4.0),
+            ("EF5 only", 5.0),
+        ):
+            self._min_ef_combo.addItem(label, value)
+        self._min_ef_combo.setToolTip(
+            "Filter to days whose strongest confirmed tornado was rated "
+            "at least this EF after the NWS damage survey. EF data is "
+            "sourced from SPC's SVRGIS archive for events older than "
+            "~6 months; younger events fall back to preliminary IEM "
+            "ratings (often unset)."
+        )
 
         # Specific date
         self._date_edit = QDateEdit(self)
@@ -69,6 +94,7 @@ class DayPickerDialog(QDialog):
         form.addRow("Min tornado reports:", self._tor_spin)
         form.addRow("Min hail reports (≥1.0\"):", self._hail_spin)
         form.addRow("Min wind reports (≥58 mph):", self._wind_spin)
+        form.addRow("Strongest tornado:", self._min_ef_combo)
         form.addRow("Specific date:", self._date_edit)
 
         buttons = QDialogButtonBox(
@@ -99,6 +125,7 @@ class DayPickerDialog(QDialog):
         self._tor_spin.setEnabled(is_random)
         self._hail_spin.setEnabled(is_random)
         self._wind_spin.setEnabled(is_random)
+        self._min_ef_combo.setEnabled(is_random)
         self._date_edit.setEnabled(is_specific)
 
     def is_live(self) -> bool:
@@ -114,6 +141,7 @@ class DayPickerDialog(QDialog):
             min_tornadoes=self._tor_spin.value(),
             min_hail=self._hail_spin.value(),
             min_wind=self._wind_spin.value(),
+            min_strongest_tornado_ef=float(self._min_ef_combo.currentData()),
         )
 
     def specific_date_12z(self) -> datetime:
