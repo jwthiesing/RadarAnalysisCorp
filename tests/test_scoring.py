@@ -224,6 +224,128 @@ def test_tore_fa_is_heaviest_penalty():
     assert ws.points == pytest.approx(-BASE_TOR_FA_PENALTY * 3.0)
 
 
+# ---- SVRGIS-sourced reports (post-survey EF + casualties) ------------
+# Verifies that scoring is source-agnostic: a SVRGIS report verifies
+# warnings, contributes to peak-EF + casualty sums, and triggers tier
+# bonuses identically to an IEM report. The data-source labeling
+# differs (``source="SVRGIS"`` vs ``"IEM"``) but the scoring contract
+# is value-based, not source-based.
+
+
+def test_svrgis_report_verifies_tor():
+    """A SVRGIS-sourced tornado report (rated or unrated) verifies a
+    TOR warning the same way an IEM report does."""
+    w = _w(wt=WarningType.TOR)
+    r = Report(
+        time=_T0 + timedelta(minutes=10),
+        lat=35.25, lon=-97.25, category="tornado",
+        magnitude=2.0, state="OK", county="",
+        remark="SVRGIS-only (no IEM LSR)",
+        injuries=0, fatalities=0, source="SVRGIS",
+    )
+    ws = score_single_warning(w, [r])
+    # Verified TOR base (no magnitudes predicted → no bonus).
+    assert ws.is_false_alarm is False
+    assert ws.points == pytest.approx(BASE_TOR_POINTS)
+
+
+def test_svrgis_post_survey_ef_triggers_pds_tor_bonus():
+    """The PDS-TOR significance gate fires when SVRGIS reports a
+    confirmed EF ≥ 2 — even if IEM's preliminary record had EF=-1.
+    This is exactly the scenario the SVRGIS backfill was added for."""
+    w = _w(wt=WarningType.PDS_TOR, mag=Magnitudes(ef=3.0))
+    # Imagine IEM had this as EF=-1 ("radar-indicated"); SVRGIS
+    # backfilled to EF3 post-survey. Scoring sees the SVRGIS value.
+    r = Report(
+        time=_T0 + timedelta(minutes=10),
+        lat=35.25, lon=-97.25, category="tornado",
+        magnitude=3.0, state="OK", county="", remark="",
+        injuries=0, fatalities=0, source="SVRGIS",
+    )
+    ws = score_single_warning(w, [r])
+    # peak_ef = 3 → significant → 1.75× tier multiplier.
+    assert ws.tier_mult == pytest.approx(1.75)
+
+
+def test_svrgis_casualties_trigger_significance_on_weak_tornado():
+    """The 'significance' branch is ``EF≥2 OR casualties > 0``. SVRGIS
+    authoritative casualty counts let a confirmed-weak (EF1) tornado
+    with deaths still trigger the PDS bonus — important because IEM's
+    free-text casualty parsing is unreliable."""
+    w = _w(wt=WarningType.PDS_TOR, mag=Magnitudes(ef=1.0))
+    r = Report(
+        time=_T0 + timedelta(minutes=10),
+        lat=35.25, lon=-97.25, category="tornado",
+        magnitude=1.0,                  # weak, post-survey EF1
+        state="OK", county="", remark="",
+        injuries=5, fatalities=2,       # post-survey confirmed deaths
+        source="SVRGIS",
+    )
+    ws = score_single_warning(w, [r])
+    # casualties > 0 → significant → 1.75× even though EF1 < 2.
+    assert ws.tier_mult == pytest.approx(1.75)
+
+
+def test_svrgis_only_tornado_counts_for_pod():
+    """SVRGIS-only tornadoes (no matching IEM LSR) should expand the
+    POD denominator just like any other tornado in the game polygon."""
+    from radar_warning_game.verification.reports_in_poly import (
+        reports_in_polygon,
+    )
+    iem_tornado = _r(magnitude=2.0)   # in-poly IEM tornado
+    svrgis_only = Report(
+        time=_T0 + timedelta(minutes=20),
+        lat=35.30, lon=-97.20, category="tornado",
+        magnitude=1.0, state="OK", county="",
+        remark="SVRGIS-only (no IEM LSR)",
+        injuries=0, fatalities=0, source="SVRGIS",
+    )
+    in_game = reports_in_polygon(_GAME_POLY, [iem_tornado, svrgis_only])
+    # Both report sources land in the denominator, regardless of source.
+    sources = sorted(r.source for r in in_game)
+    assert sources == ["IEM", "SVRGIS"]
+    assert len(in_game) == 2
+
+
+def test_unrated_svrgis_tornado_doesnt_corrupt_peak_ef():
+    """A SVRGIS row with no confirmed EF (``magnitude = -1``, e.g. a
+    historical record where the survey couldn't pin a rating) is
+    correctly skipped by the peak-EF computation when a rated report
+    exists. (Note: the per-warning ``tier_mult`` field is a *mean of
+    per-match* multipliers, not the peak — so adding an unrated
+    tornado does dilute that mean toward 1.0×. That's the existing
+    scoring contract, independent of SVRGIS.)"""
+    from radar_warning_game.verification.scoring import _peak_observed_ef
+    from radar_warning_game.verification.reports_in_poly import (
+        VerifyingMatch,
+    )
+    w = _w(wt=WarningType.PDS_TOR, mag=Magnitudes(ef=3.0))
+    rated = Report(
+        time=_T0 + timedelta(minutes=10),
+        lat=35.25, lon=-97.25, category="tornado",
+        magnitude=3.0, state="OK", county="", remark="",
+        injuries=0, fatalities=0, source="SVRGIS",
+    )
+    unrated = Report(
+        time=_T0 + timedelta(minutes=15),
+        lat=35.30, lon=-97.20, category="tornado",
+        magnitude=-1.0, state="OK", county="",
+        remark="SVRGIS-only (no IEM LSR)",
+        injuries=0, fatalities=0, source="SVRGIS",
+    )
+    # The peak-EF helper takes verifying matches; build minimal ones
+    # bound to the warning's current revision.
+    rev = w.current_revision
+    matches = [
+        VerifyingMatch(warning=w, revision=rev, report=rated,
+                       lead_time=timedelta(minutes=10), late_warn=False),
+        VerifyingMatch(warning=w, revision=rev, report=unrated,
+                       lead_time=timedelta(minutes=15), late_warn=False),
+    ]
+    # Peak from the helper should pick the rated 3.0, not the -1.
+    assert _peak_observed_ef(matches) == pytest.approx(3.0)
+
+
 # ---- magnitude-revision semantics (plan §5) -------------------------
 
 def test_magnitude_revision_picks_active_at_peak():

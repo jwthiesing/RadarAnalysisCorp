@@ -493,14 +493,20 @@ class PlayView(QWidget):
 
         Adds a visible affordance: crosshair cursor + status-bar message.
         Esc / right-click cancels; double-click or Enter finishes.
+
+        Hands ALL panels' ViewBoxes to the editor so a vertex click on
+        any panel registers and the in-flight polygon mirrors across
+        every panel. Without this, only the focused panel responded
+        and the other three sat ignoring clicks — confusing because
+        they all show the same view.
         """
         if not self.radar_grid._panels:
             return
-        panel = self.radar_grid._panels[self.radar_grid._focused_panel_index()]
         site = self.radar_grid.site
         from ..geo.projection import xy_km_to_latlon
+        views = [p.view for p in self.radar_grid._panels]
         self._active_poly_editor = PolygonEditor(
-            panel.view,
+            views,
             axes_to_latlon=lambda x, y: xy_km_to_latlon(x, y, site.lat, site.lon),
             color=color,
         )

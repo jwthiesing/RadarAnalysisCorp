@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -263,18 +264,39 @@ def fetch_reports(
     end: datetime,
     *,
     use_spc_backfill: bool = True,
+    use_svrgis_backfill: bool = True,
     today: datetime | None = None,
 ) -> list[Report]:
     """Top-level entry: returns the normalized report list for ``[start, end]`` (UTC).
 
-    When ``use_spc_backfill`` is True and the event predates today by more than
-    ``SPC_BACKFILL_THRESHOLD_DAYS``, SPC tornado data overlays IEM rows where it
-    has better EF / casualty info. Non-tornado reports always come from IEM.
-    """
+    Tornado reports get supplementary data layered in *in priority order*:
+
+      1. **SVRGIS** (SPC Severe Weather Database) — post-survey EF +
+         finalized casualty counts from NWS damage surveys. Annual
+         publication with ~6 mo lag, so applied only to events older
+         than ``SVRGIS_PUBLICATION_LAG`` (default 180 days). Most
+         reliable source we have when the data exists.
+      2. **SPC daily filtered CSV** — same-day SPC publication. Still
+         preliminary but often carries EF when IEM doesn't. Applied
+         to events older than ``SPC_BACKFILL_THRESHOLD_DAYS`` (30 days)
+         and not already filled in by SVRGIS.
+      3. **IEM LSRs** (the baseline) — real-time NWS issuance, EF
+         frequently unset, casualty counts parsed from free-text
+         remarks.
+
+    Non-tornado reports always come from IEM. The merge is non-
+    destructive: SVRGIS / SPC values overlay IEM where they're more
+    informative, but a SVRGIS row marked unrated (``mag = -9``) leaves
+    the IEM value alone."""
     iem = fetch_iem_window(start, end)
     if not use_spc_backfill or not _should_backfill_with_spc(start, today):
         return iem
-    # Backfill tornado EF / casualties from SPC where row matches by approx (time, lat, lon).
+    # ---- Step 1: SVRGIS backfill for tornadoes (preferred) ----
+    iem = _backfill_with_svrgis(
+        iem, start=start, end=end, today=today, enabled=use_svrgis_backfill,
+    )
+    # ---- Step 2: SPC daily-filtered CSV overlay for any remaining
+    #              tornado reports that still lack a confirmed EF ----
     try:
         spc_df = fetch_spc_tornadoes_day(start)
     except Exception as e:  # noqa: BLE001
@@ -282,10 +304,14 @@ def fetch_reports(
         return iem
     if spc_df.empty:
         return iem
-
     out = []
     for r in iem:
         if r.category != "tornado":
+            out.append(r)
+            continue
+        # If SVRGIS already supplied a confirmed EF, don't overwrite
+        # with the preliminary SPC daily file.
+        if r.source == "SVRGIS" and r.magnitude >= 0:
             out.append(r)
             continue
         match = _spc_match(r, spc_df)
@@ -293,6 +319,148 @@ def fetch_reports(
             out.append(r)
             continue
         out.append(_merge_spc_into_iem(r, match))
+    return out
+
+
+def _backfill_with_svrgis(
+    reports: list[Report],
+    *,
+    start: datetime,
+    end: datetime,
+    today: datetime | None,
+    enabled: bool,
+) -> list[Report]:
+    """Two-pass SVRGIS integration for tornadoes:
+
+      1. **Merge** — for every IEM tornado that has a SVRGIS match
+         (by time + location tolerance), overlay the post-survey EF
+         and casualty counts. Same as before.
+      2. **Add SVRGIS-only** — for every SVRGIS tornado in the
+         ``[start, end]`` window whose ``om`` (sequential id) wasn't
+         consumed by step 1, append a new Report. This catches the
+         common case where the post-survey database has tornadoes
+         IEM's preliminary LSRs missed entirely — often small EF0s
+         in rural areas where no spotters / damage surveys reached
+         until after the LSR window closed.
+
+    Skips entirely if disabled, if the event is too recent for SVRGIS
+    coverage (publication-lag window), or if the SVRGIS load fails."""
+    if not enabled:
+        return reports
+    from .spc_svrgis import (
+        find_tornado_record, has_svrgis_coverage,
+        magnitude_from_svrgis, casualties_from_svrgis,
+    )
+    if not has_svrgis_coverage(start, today=today):
+        return reports
+    try:
+        from .spc_svrgis import load_svrgis
+        df = load_svrgis()
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] SVRGIS backfill unavailable: {e}")
+        return reports
+
+    out: list[Report] = []
+    backfilled = 0
+    # Track which SVRGIS rows have already been consumed by an IEM
+    # match so the SVRGIS-only pass doesn't double-add them. ``om``
+    # is the sequential tornado id and is unique per row.
+    matched_oms: set[int] = set()
+
+    # ---- pass 1: merge SVRGIS into matched IEM tornadoes ----
+    for r in reports:
+        if r.category != "tornado":
+            out.append(r)
+            continue
+        row = find_tornado_record(r.time, r.lat, r.lon)
+        if row is None:
+            out.append(r)
+            continue
+        try:
+            matched_oms.add(int(row["om"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+        mag = magnitude_from_svrgis(row)
+        inj, fat = casualties_from_svrgis(row)
+        # If SVRGIS has nothing better than IEM for ALL fields, keep
+        # the IEM record (avoids relabeling source=SVRGIS on a row
+        # where SVRGIS contributed no actual information).
+        if mag < 0 and inj == 0 and fat == 0:
+            out.append(r)
+            continue
+        out.append(Report(
+            time=r.time, lat=r.lat, lon=r.lon,
+            category="tornado",
+            magnitude=mag if mag >= 0 else r.magnitude,
+            state=r.state, county=r.county,
+            remark=r.remark,
+            injuries=max(inj, r.injuries),
+            fatalities=max(fat, r.fatalities),
+            source="SVRGIS",
+        ))
+        backfilled += 1
+
+    # ---- pass 2: add SVRGIS-only tornadoes in the time window ----
+    # Normalize the window to naive UTC for comparison with df['utc_dt']
+    # (which is naive-UTC as built by ``spc_svrgis.load_svrgis``).
+    if start.tzinfo is None:
+        start_utc = start.replace(tzinfo=timezone.utc)
+    else:
+        start_utc = start.astimezone(timezone.utc)
+    if end.tzinfo is None:
+        end_utc = end.replace(tzinfo=timezone.utc)
+    else:
+        end_utc = end.astimezone(timezone.utc)
+    start_ts = pd.Timestamp(start_utc.replace(tzinfo=None))
+    end_ts = pd.Timestamp(end_utc.replace(tzinfo=None))
+    in_window = df[(df["utc_dt"] >= start_ts) & (df["utc_dt"] <= end_ts)]
+    added = 0
+    for _, row in in_window.iterrows():
+        try:
+            om = int(row["om"])
+        except (TypeError, ValueError):
+            continue
+        if om in matched_oms:
+            continue
+        try:
+            lat = float(row["slat"])
+            lon = float(row["slon"])
+        except (TypeError, ValueError):
+            continue
+        if not (np.isfinite(lat) and np.isfinite(lon)):
+            continue
+        # Reconstruct the UTC datetime from the precomputed naive
+        # Timestamp + UTC tz tag for the Report's ``time`` field.
+        utc_dt = row["utc_dt"]
+        if pd.isna(utc_dt):
+            continue
+        report_time = utc_dt.to_pydatetime().replace(tzinfo=timezone.utc)
+        mag = magnitude_from_svrgis(row)
+        inj, fat = casualties_from_svrgis(row)
+        state = str(row.get("st") or "").strip()
+        out.append(Report(
+            time=report_time,
+            lat=lat, lon=lon,
+            category="tornado",
+            magnitude=mag,   # may be -1 (unrated) — that's still useful presence info
+            state=state,
+            county="",
+            remark="SVRGIS-only (no IEM LSR)",
+            injuries=inj,
+            fatalities=fat,
+            source="SVRGIS",
+        ))
+        added += 1
+
+    if backfilled or added:
+        msg_parts = []
+        if backfilled:
+            msg_parts.append(f"backfilled {backfilled} IEM tornado(es) "
+                             "with post-survey EF/casualties")
+        if added:
+            msg_parts.append(f"added {added} SVRGIS-only tornado(es) "
+                             "missing from IEM")
+        print("[info] SVRGIS: " + "; ".join(msg_parts))
     return out
 
 

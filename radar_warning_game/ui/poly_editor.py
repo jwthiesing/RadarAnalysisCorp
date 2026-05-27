@@ -27,7 +27,8 @@ log = logging.getLogger(__name__)
 
 
 class PolygonEditor(QObject):
-    """Click-to-draw polygon editor wired into a pyqtgraph ViewBox.
+    """Click-to-draw polygon editor wired into one *or more* pyqtgraph
+    ViewBoxes.
 
     Emits :attr:`polygon_changed` with the updated :class:`Polygon` (or
     ``None`` if fewer than 3 vertices) every time a vertex is added or
@@ -35,9 +36,19 @@ class PolygonEditor(QObject):
     picker that's a "Confirm" button, for a warning issuance that's the
     "Issue" button.
 
+    Multi-view support is what makes the radar grid usable: when the
+    host opens a 4-panel layout, the editor should accept clicks on
+    **any** panel and mirror the in-flight polygon outline + vertex
+    markers across all four. Pass either a single :class:`pyqtgraph.ViewBox`
+    (for the CONUS overview map, which is single-view) or a list of
+    them (for the radar grid).
+
     Parameters
     ----------
-    view : :class:`pyqtgraph.ViewBox` to draw on.
+    view : a :class:`pyqtgraph.ViewBox` or list of them. All views are
+        assumed to share the same data coordinate system — the editor's
+        vertex list is in the *shared* coord space and is rendered
+        identically on each.
     axes_to_latlon : function that converts ``(x, y)`` view coordinates to
         ``(lat, lon)``. For a radar-centric km axes this projects through
         the radar site; for a plain lat/lon map it's ``lambda x, y: (y, x)``.
@@ -48,7 +59,7 @@ class PolygonEditor(QObject):
 
     def __init__(
         self,
-        view: pg.ViewBox,
+        view,   # pg.ViewBox | list[pg.ViewBox]
         axes_to_latlon: Callable[[float, float], tuple[float, float]],
         *,
         color: str = "#ffd400",
@@ -56,7 +67,15 @@ class PolygonEditor(QObject):
         marker_size: int = 10,
     ) -> None:
         super().__init__()
-        self.view = view
+        # Normalize to a list of views — single-view callers (the
+        # CONUS map) still work via this list path. ``self.view``
+        # stays as the first/primary view for back-compat with any
+        # external code that reaches for it.
+        if isinstance(view, list):
+            self.views: list[pg.ViewBox] = list(view)
+        else:
+            self.views = [view]
+        self.view = self.views[0]
         self._axes_to_latlon = axes_to_latlon
         self._color = color
         self._linewidth = linewidth
@@ -64,23 +83,43 @@ class PolygonEditor(QObject):
         self._enabled = True
         self._vertices: list[tuple[float, float]] = []   # in view coords (x, y)
 
-        # Persistent artists
-        self._outline = pg.PlotCurveItem(
-            x=[], y=[], pen=pg.mkPen(color=color, width=linewidth),
-        )
-        self._outline.setZValue(15)
-        self.view.addItem(self._outline)
-        self._markers = pg.ScatterPlotItem(
-            x=[], y=[], size=marker_size,
-            pen=pg.mkPen("white", width=1.0),
-            brush=pg.mkBrush(color),
-            pxMode=True,
-        )
-        self._markers.setZValue(16)
-        self.view.addItem(self._markers)
+        # One pair of persistent artists per view so the in-flight
+        # outline + vertex markers appear on every panel as the user
+        # builds the polygon. ``_refresh_artists`` updates them in
+        # lockstep so the panels stay visually identical.
+        self._outlines: list[pg.PlotCurveItem] = []
+        self._markers_items: list[pg.ScatterPlotItem] = []
+        for v in self.views:
+            outline = pg.PlotCurveItem(
+                x=[], y=[], pen=pg.mkPen(color=color, width=linewidth),
+            )
+            outline.setZValue(15)
+            v.addItem(outline)
+            self._outlines.append(outline)
+            markers = pg.ScatterPlotItem(
+                x=[], y=[], size=marker_size,
+                pen=pg.mkPen("white", width=1.0),
+                brush=pg.mkBrush(color),
+                pxMode=True,
+            )
+            markers.setZValue(16)
+            v.addItem(markers)
+            self._markers_items.append(markers)
+        # Back-compat aliases used by some tests / external callers
+        # that look for the singular ``_outline`` / ``_markers``.
+        self._outline = self._outlines[0]
+        self._markers = self._markers_items[0]
 
-        # Mouse events come from the scene; we filter to in-view clicks.
-        self.view.scene().sigMouseClicked.connect(self._on_scene_clicked)
+        # Subscribe to EVERY view's scene so a click on any panel adds
+        # a vertex. The lambda captures the originating view so we can
+        # map the scene-space click back to data coordinates via that
+        # view's projection — synced views share the same data range
+        # so the resulting (x, y) is identical regardless of which
+        # panel the user clicked.
+        for v in self.views:
+            v.scene().sigMouseClicked.connect(
+                lambda ev, src=v: self._on_scene_clicked(ev, src)
+            )
 
     # ---- public API --------------------------------------------------
 
@@ -123,13 +162,17 @@ class PolygonEditor(QObject):
 
     # ---- mouse handling ---------------------------------------------
 
-    def _on_scene_clicked(self, ev) -> None:
+    def _on_scene_clicked(self, ev, src_view: "pg.ViewBox | None" = None) -> None:
         if not self._enabled:
             return
-        if not self.view.sceneBoundingRect().contains(ev.scenePos()):
+        # The originating view is passed in by the lambda we registered
+        # per-view in __init__; fall back to the primary if a caller
+        # invokes this directly (tests / introspection).
+        view = src_view if src_view is not None else self.view
+        if not view.sceneBoundingRect().contains(ev.scenePos()):
             return
         try:
-            data_pt = self.view.mapSceneToView(ev.scenePos())
+            data_pt = view.mapSceneToView(ev.scenePos())
         except Exception:  # noqa: BLE001
             return
         x, y = float(data_pt.x()), float(data_pt.y())
@@ -168,17 +211,23 @@ class PolygonEditor(QObject):
     # ---- rendering ---------------------------------------------------
 
     def _refresh_artists(self) -> None:
+        """Push the current vertex list to every view's outline +
+        markers so the in-flight polygon mirrors across all panels."""
         verts = self.vertices_axes()
         if len(verts) >= 1:
-            self._markers.setData(x=verts[:, 0], y=verts[:, 1])
+            marker_x, marker_y = list(verts[:, 0]), list(verts[:, 1])
         else:
-            self._markers.setData(x=[], y=[])
+            marker_x, marker_y = [], []
         if len(verts) >= 2:
             xs = list(verts[:, 0])
             ys = list(verts[:, 1])
             if len(verts) >= 3:
                 xs.append(xs[0])
                 ys.append(ys[0])
-            self._outline.setData(x=xs, y=ys)
+            outline_x, outline_y = xs, ys
         else:
-            self._outline.setData(x=[], y=[])
+            outline_x, outline_y = [], []
+        for markers in self._markers_items:
+            markers.setData(x=marker_x, y=marker_y)
+        for outline in self._outlines:
+            outline.setData(x=outline_x, y=outline_y)

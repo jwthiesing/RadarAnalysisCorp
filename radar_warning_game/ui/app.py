@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
 
 from ..data.cache import DEFAULT_CACHE_ROOT, HashedCache
 from ..data.prefetch import Prefetcher
-from ..data.reports import Report, fetch_iem_window
+from ..data.reports import Report, fetch_reports
 from ..game.clock import GameClock, LiveClock
 from ..game.event_reveal import reveal_for
 from ..game.round_builder import (
@@ -80,7 +80,12 @@ class _DayFetchWorker(QThread):
                 from datetime import timedelta as _td, timezone as _tz
                 now = datetime.now(_tz.utc)
                 start = now - _td(hours=self.live_lookback_hours)
-                reports = fetch_iem_window(start, now)
+                # Live mode never hits SVRGIS coverage (events are by
+                # definition within the publication-lag window), but
+                # going through ``fetch_reports`` keeps the report
+                # source consistent with historical mode and lets us
+                # add other live-only enrichments in one place later.
+                reports = fetch_reports(start, now)
                 today_12z = now.replace(hour=12, minute=0, second=0, microsecond=0)
                 day = RoundDay(
                     convective_day_12z=today_12z, reports=reports,

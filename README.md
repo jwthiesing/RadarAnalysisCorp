@@ -168,7 +168,25 @@ Each verifying report contributes a tier multiplier based on the **revision acti
 
 **Magnitude bonus** is the mean of hail/wind/EF accuracy components. **Predicted-but-unverified hazards contribute 0** to that mean — predict only what you expect. (So an SVR with predicted hail=2.0" + wind=100 mph that verifies only via hail scores half the mag bonus of one with verified hail + matching wind prediction.)
 
-POD denominator uses the game polygon with the same 5 km verification buffer, so reports just outside the strict polygon edge that verify a warning also count in the denominator (symmetric accounting).
+POD denominator uses the game polygon with the same 5 km verification buffer, so reports just outside the strict polygon edge that verify a warning also count in the denominator (symmetric accounting). **Both IEM-sourced and SVRGIS-sourced reports** count toward POD — scoring is source-agnostic.
+
+### Storm-report sources
+
+Tornado reports are layered through three sources in priority order before scoring sees them. The merge is non-destructive: each higher-priority source overlays IEM fields where it has more reliable info, and SVRGIS contributes **additional tornadoes** that IEM missed entirely.
+
+1. **SVRGIS** (SPC Severe Weather Database) — the annual 1950-present tornado archive (~70 k records, ~8 MB single CSV at [spc.noaa.gov/wcm](https://www.spc.noaa.gov/wcm/)). Carries **post-survey EF ratings + finalized injury / fatality counts** from NWS damage surveys conducted after the event. Applied to every event older than `SVRGIS_PUBLICATION_LAG` (default 180 days, since SVRGIS publishes annually with ~6 months of damage-survey lag). Two-pass integration: (a) merge SVRGIS fields into matched IEM reports; (b) add SVRGIS-only tornadoes whose `om` wasn't consumed by step (a) — typically small EF0/EF1 rural tornadoes that didn't make it into preliminary LSRs. See [data/spc_svrgis.py](radar_warning_game/data/spc_svrgis.py).
+2. **SPC daily filtered CSV** — same-day preliminary publication. Applied to events older than `SPC_BACKFILL_THRESHOLD_DAYS` (30 days) and not already filled in by SVRGIS. Bridges the 30-day-to-180-day window where the daily file may have EF info before the annual SVRGIS publication catches up.
+3. **IEM LSRs** — the baseline, real-time NWS issuance. EF is frequently unset ("radar-indicated") and casualties are parsed from free-text remarks (regex-fragile). Wind and hail reports always come from IEM since they don't need post-survey backfill — magnitudes are populated reliably in real time for those categories.
+
+Pipeline integration:
+
+| Surface | Source visibility |
+|---|---|
+| CONUS overview map (polygon / radar picker) | All three sources combined; tornado markers sized by post-survey EF |
+| Time-distribution histogram | Same combined set; counts include SVRGIS-only additions |
+| Radar panels' live-report overlay | Same combined set; markers fade with time as before |
+| Host central map | Same combined set |
+| Scoring | Same combined set; POD denominator + tier-multiplier significance gate + casualty-bonus all evaluated on the post-survey values when available. Unrated tornadoes (`magnitude = -1`) still verify TOR-family warnings (they're a tornado in the polygon) but don't drag the peak-EF helper or contribute to PDS/TORE significance by themselves |
 
 **MCDs** (Mesoscale Convective Discussions) use SPC's Peak Intensity Bin system. Players pick PIB 1–7 (tornado/wind) or 1–6 (hail), or "None" per hazard. Scoring components:
 - **Per-hazard PIB accuracy** (closer to observed = better; observed PIB 0 + predicted None = small credit)
@@ -326,7 +344,8 @@ radar_warning_game/
 │   ├── radar_s3.py         # Unsigned boto3 client for unidata-nexrad-level2
 │   ├── live.py             # IEM live mirror scraper for LIVE-mode rounds
 │   ├── sweep_index.py      # SAILS-aware per-sweep index across loaded volumes
-│   ├── reports.py          # IEM LSR + SPC backfill + daily-counts index
+│   ├── reports.py          # IEM LSR + SPC daily + SVRGIS backfill + daily-counts index
+│   ├── spc_svrgis.py       # SPC Severe Weather DB (post-survey EF + casualties)
 │   ├── prefetch.py         # Background-thread parallel downloads, live + S3 modes
 │   └── cache.py            # HashedCache + 30-day startup cleanup
 ├── geo/
@@ -389,7 +408,7 @@ pip install -e ".[dev]"
 python -m pytest tests/ -q
 ```
 
-261 tests covering: SAILS sweep index, 5-km buffered point-in-polygon, scoring metrics (incl. team aggregation, magnitude revisions, per-revision tier), tier multipliers, MCD PIB scoring and anti-spam, protocol round-trip, multiplayer state appliers, date-blinding scrape, casualty regex, cache, clock, session state machine, replay, event reveal, colors, sites, live source, round builder. Runs in ~2 seconds.
+269 tests covering: SAILS sweep index, 5-km buffered point-in-polygon, scoring metrics (incl. team aggregation, magnitude revisions, per-revision tier), tier multipliers, MCD PIB scoring and anti-spam, protocol round-trip, multiplayer state appliers, date-blinding scrape, casualty regex, cache, clock, session state machine, replay, event reveal, colors, sites, live source, round builder. Runs in ~2 seconds.
 
 GitHub Actions CI at [`.github/workflows/test.yml`](.github/workflows/test.yml) runs the suite on Python 3.11 and 3.12 with Qt offscreen + cartopy system deps.
 
@@ -401,7 +420,6 @@ GitHub Actions CI at [`.github/workflows/test.yml`](.github/workflows/test.yml) 
 - **Host disconnect** ends the round in v1 (no host migration)
 - **Late-warn POD credit** is allowed only for TORR (10-minute window)
 - **Replay playback** UI not implemented; replay JSON files are written but only readable by tooling
-- **SPC final-EF backfill** is best-effort; SPC's daily filtered CSV has a messy multi-section format that defeats naive `pd.read_csv` and we fall back to IEM preliminary data when matching fails
 - **All four panels show the same radar at a time.** Switching between enabled radars uses the **Radar:** dropdown in the toolbar (appears when the host enabled more than one site). Each site's volumes are downloaded + indexed independently in the background, so switching is instant once the new site has at least one volume cached; otherwise the panels show a "no sweep selected" placeholder until the new site's first volume lands.
 - **Town labels** beyond major cities not wired (counties drawn but unlabeled)
 - **`adjustText`** is no longer installed/used; some city labels may overlap at certain zoom levels (the greedy non-overlap algorithm hides smaller cities to compensate)

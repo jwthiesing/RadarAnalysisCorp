@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from ..data.reports import (
     Report,
     count_by_category,
-    fetch_iem_window,
+    fetch_reports,
     get_daily_counts,
 )
 
@@ -65,11 +65,20 @@ def _convective_day_bounds(day_12z: datetime) -> tuple[datetime, datetime]:
 
 
 def pick_specific_day(day_12z_date: datetime) -> RoundDay:
-    """Pick a specific 12Z convective day. ``day_12z_date`` should be the 12Z timestamp."""
+    """Pick a specific 12Z convective day. ``day_12z_date`` should be the 12Z timestamp.
+
+    Goes through :func:`fetch_reports` (not raw ``fetch_iem_window``) so
+    tornado magnitudes / casualty counts get backfilled from SPC SVRGIS
+    + SPC daily-filtered overlays before the day's reports propagate
+    into the CONUS overview map, the time-distribution histogram, and
+    scoring. For events older than ~6 months that means actual
+    post-survey EF ratings; for events 30 days-6 months old that means
+    the SPC daily-filtered overlay; for very recent events it's a
+    no-op fallthrough to the raw IEM data."""
     if day_12z_date.tzinfo is None:
         day_12z_date = day_12z_date.replace(tzinfo=timezone.utc)
     start, end = _convective_day_bounds(day_12z_date)
-    reports = fetch_iem_window(start, end)
+    reports = fetch_reports(start, end)
     return RoundDay(
         convective_day_12z=start,
         reports=reports,
