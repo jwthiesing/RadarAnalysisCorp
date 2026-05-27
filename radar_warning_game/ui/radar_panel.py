@@ -127,7 +127,7 @@ PRODUCTS: dict[str, tuple[str, str, float, float]] = {
     "REF": ("reflectivity",                "ChaseSpectral", -10.0, 75.0),
     "VEL": ("velocity",                    "Carbone42",     -40.0, 40.0),
     "SW":  ("spectrum_width",              "magma",           0.0, 15.0),
-    "CC":  ("cross_correlation_ratio",     "NWSRef",          0.0,  1.0),
+    "CC":  ("cross_correlation_ratio",     "plasma",          0.0,  1.0),
     "ZDR": ("differential_reflectivity",   "ChaseSpectral",   0.0,  7.5),
     "PHI": ("differential_phase",          "Wild25",          0.0, 360.0),
 }
