@@ -43,6 +43,7 @@ from ..geo.polygons import Polygon
 from ..net.multiplayer import MultiplayerHost, MultiplayerPeer
 from .controls import ClockControls
 from .host_map import HostCentralMap
+from .leaderboard import LiveLeaderboardWindow
 from .mcd_form import MCDFormDialog
 from .motion_tool import MotionTool
 from .poly_editor import PolygonEditor
@@ -168,6 +169,18 @@ class PlayView(QWidget):
             self.host_map.setWindowTitle("Host overview — all players")
             self.host_map.resize(900, 700)
             self.host_map.show()
+
+        # Live leaderboard as a free-standing window for every client —
+        # hosts, peers, AND solo. The host central map also docks the
+        # same widget in its sidebar, but peers and solo players don't
+        # have that view, so without this they'd never see running
+        # standings. Local team-id is the local player's solo team
+        # placeholder (in non-team mode) or their actual team after
+        # roster freeze; either way it powers the "you" highlight.
+        me = session.players.get(local_player_id)
+        local_team_id = me.team_id if me is not None else None
+        self.leaderboard_window = LiveLeaderboardWindow(local_team_id=local_team_id)
+        self.leaderboard_window.show()
 
         # Clock controls (host only — single-player IS the host).
         # On peer clients we still need _on_tick to fire so the map/leaderboard
@@ -445,6 +458,17 @@ class PlayView(QWidget):
         # via the live-reports overlay we just updated.
         if self.host_map is not None:
             self.host_map.refresh()
+        # Refresh the per-client live leaderboard window — provisional
+        # scores update as reports come in (a tick that doesn't cross
+        # a report's timestamp is a no-op inside current_scores). On
+        # the host, this is the same widget as the host map's sidebar,
+        # but pulling the snapshot here keeps the standalone window
+        # in sync on peers + solo where there's no host map driving it.
+        try:
+            scores = self.session.current_scores()
+        except Exception:  # noqa: BLE001
+            scores = []
+        self.leaderboard_window.refresh(scores, self.session.team_names)
         # Broadcast the tick to peers (host only)
         if isinstance(self.multiplayer, MultiplayerHost):
             asyncio.ensure_future(self.multiplayer.broadcast_tick(tick))
@@ -800,4 +824,11 @@ class PlayView(QWidget):
         if self.host_map is not None:
             self.host_map.close()
             self.host_map = None
+        # And the free-standing live-leaderboard window we opened for
+        # every client. Re-uses the WA_DeleteOnClose / parent-on-exit
+        # contract — close() returns immediately, Qt's own teardown
+        # finishes the lifecycle when the event loop quiesces.
+        if self.leaderboard_window is not None:
+            self.leaderboard_window.close()
+            self.leaderboard_window = None
         self.prefetcher.shutdown(wait=False)

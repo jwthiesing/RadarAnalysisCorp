@@ -104,6 +104,38 @@ class LiveLeaderboardWidget(QFrame):
         )
 
 
+class LiveLeaderboardWindow(QWidget):
+    """Free-standing top-level window wrapping :class:`LiveLeaderboardWidget`.
+
+    The host central map docks the same widget in its own side panel,
+    but peers and solo players don't have a host map — so without this
+    they never see live scores. The window is shown for every client
+    so everyone gets the running standings during play.
+
+    Pass ``local_team_id`` so the "you" marker / bold row highlights
+    the right team. The window's :meth:`refresh` is a thin pass-through
+    to the inner widget; PlayView calls it on every tick.
+    """
+
+    def __init__(
+        self,
+        local_team_id: str | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        # No parent → independent top-level window, but still owned by
+        # the Qt application so it dies with the main window.
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle("Live leaderboard")
+        self.resize(360, 220)
+        self.widget = LiveLeaderboardWidget(local_team_id=local_team_id, parent=self)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.widget)
+
+    def refresh(self, scores: list[TeamScore], team_names: dict[str, str] | None = None) -> None:
+        self.widget.refresh(scores, team_names)
+
+
 class FinalLeaderboardDialog(QDialog):
     """End-of-round full breakdown dialog (plan §9)."""
 
