@@ -70,6 +70,8 @@ from ..data.sweep_index import SweepIndex, SweepRef
 from ..data.sites import Site, site_by_icao
 from ..geo.polygons import Polygon as GamePolygon
 from ..geo.projection import latlon_to_xy_km
+from . import colormaps as _ui_colormaps  # noqa: F401 — side-effect: registers RadarCope w/ matplotlib
+from .colormaps import VELOCITY_COLORMAP_CHOICES
 from .time_format import format_player_time
 
 log = logging.getLogger(__name__)
@@ -125,7 +127,7 @@ class DealiasMode(str, Enum):
 # becomes available.
 PRODUCTS: dict[str, tuple[str, str, float, float]] = {
     "REF": ("reflectivity",                "ChaseSpectral", -10.0, 75.0),
-    "VEL": ("velocity",                    "Carbone42",     -40.0, 40.0),
+    "VEL": ("velocity",                    "RadarCope",    -100.0, 100.0),
     "SW":  ("spectrum_width",              "magma",           0.0, 15.0),
     "CC":  ("cross_correlation_ratio",     "plasma",          0.0,  1.0),
     "ZDR": ("differential_reflectivity",   "ChaseSpectral",   0.0,  7.5),
@@ -831,9 +833,10 @@ class RadarPanel(QFrame):
         self.product = product
         # User-tunable velocity range (m/s). The colormap is symmetric so
         # we just store the half-range — vmin = -vel_vmax, vmax =
-        # +vel_vmax. Defaults to PRODUCTS["VEL"]'s 40 m/s but the grid
-        # can override per-instance via :meth:`set_vel_range`. Doesn't
-        # affect other products' fixed PRODUCTS entries.
+        # +vel_vmax. Defaults to PRODUCTS["VEL"]'s 100 m/s (matches the
+        # ±200-kt RadarCope palette) but the grid can override per-
+        # instance via :meth:`set_vel_range`. Doesn't affect other
+        # products' fixed PRODUCTS entries.
         self._vel_vmax: float = float(PRODUCTS["VEL"][3])
         # CC colormap lower bound. PRODUCTS["CC"]'s static vmin is 0.0,
         # but ρhv values below ~0.7 in actual storms are pure
@@ -843,6 +846,10 @@ class RadarPanel(QFrame):
         # vmin spinbox sets this per-grid; we keep an instance field so
         # the per-panel rasterize path can pick it up.
         self._cc_vmin: float = 0.5
+        # User-selectable VEL colormap (toolbar dropdown). Overrides
+        # PRODUCTS["VEL"]'s static name. Default "RadarCope" is closer
+        # to the NWS-style velocity color scheme forecasters expect.
+        self._vel_cmap_name: str = "RadarCope"
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
@@ -1136,6 +1143,8 @@ class RadarPanel(QFrame):
             # user-tunable ±vel_vmax — the colormap is symmetric so
             # one half-range value fully describes it.
             vmin, vmax = -self._vel_vmax, self._vel_vmax
+            # Override the colormap with the user's toolbar pick.
+            cmap_name = self._vel_cmap_name
             if velocity_field is not None:
                 field = velocity_field
                 if field not in radar.fields and "velocity" in radar.fields:
@@ -2253,9 +2262,10 @@ class RadarPanelGrid(QWidget):
         h.addSpacing(10)
 
         # VEL ± range — symmetric vmax for the velocity colormap.
-        # Defaults to whatever PRODUCTS["VEL"] says (40 m/s) so we
-        # don't break the visual baseline; host can stretch or
-        # compress to match the day.
+        # Defaults to whatever PRODUCTS["VEL"] says (100 m/s — matches
+        # the RadarCope palette's ±200-kt span so the full color range
+        # is visible without clipping); host can compress to ±40 or so
+        # to amplify contrast on weak-shear days.
         h.addWidget(QLabel("VEL ±:", bar))
         from PyQt6.QtWidgets import QDoubleSpinBox
         self._vel_range_spin = QDoubleSpinBox(bar)
@@ -2270,10 +2280,11 @@ class RadarPanelGrid(QWidget):
         self._vel_range_spin.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._vel_range_spin.setToolTip(
             "Symmetric ± range for the velocity color scale. Default "
-            "±40 m/s suits most ordinary storms; raise to ±80+ when "
-            "tracking violent rotation / strong shear so deep reds "
-            "and greens don't saturate. Affects ALL VEL panels in "
-            "the grid simultaneously."
+            "±100 m/s matches the RadarCope palette's ±200-kt span so "
+            "every band in the palette is visible. Compress to ±40 or "
+            "so to amplify contrast on weak-shear days; raise toward "
+            "±150 if you need headroom past 200 kts. Affects ALL VEL "
+            "panels in the grid simultaneously."
         )
         self._vel_range_spin.valueChanged.connect(self.set_vel_range)
         h.addWidget(self._vel_range_spin)
@@ -2302,6 +2313,31 @@ class RadarPanelGrid(QWidget):
         )
         self._cc_vmin_spin.valueChanged.connect(self.set_cc_vmin)
         h.addWidget(self._cc_vmin_spin)
+        h.addSpacing(10)
+
+        # VEL colormap picker — RadarCope (NWS-style, default) or
+        # Carbone42 (PyART classic). Adding more options is a matter
+        # of appending names to ``VELOCITY_COLORMAP_CHOICES`` in
+        # ``colormaps.py`` and registering them with matplotlib.
+        h.addWidget(QLabel("VEL cmap:", bar))
+        self._vel_cmap_combo = QComboBox(bar)
+        for name in VELOCITY_COLORMAP_CHOICES:
+            self._vel_cmap_combo.addItem(name, name)
+        initial = (self._panels[0]._vel_cmap_name if self._panels
+                   else VELOCITY_COLORMAP_CHOICES[0])
+        idx = max(0, self._vel_cmap_combo.findData(initial))
+        self._vel_cmap_combo.setCurrentIndex(idx)
+        self._vel_cmap_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._vel_cmap_combo.setToolTip(
+            "Colormap for the velocity product. RadarCope (default) "
+            "matches the NWS-style scheme — cools (greens/blues) inbound, "
+            "warms (reds/oranges) outbound, gray at zero. Carbone42 is "
+            "PyART's classic alternative."
+        )
+        self._vel_cmap_combo.currentIndexChanged.connect(
+            lambda _i: self.set_vel_cmap(self._vel_cmap_combo.currentData())
+        )
+        h.addWidget(self._vel_cmap_combo)
         h.addStretch(1)
 
         outer = self.layout()
@@ -2365,11 +2401,10 @@ class RadarPanelGrid(QWidget):
         """Set the symmetric ±velocity colormap range (m/s) on every
         panel and trigger a re-render. Used by the toolbar's "VEL ±"
         spinbox so the host can stretch / compress the velocity color
-        scale to match the day's flow — default ±40 m/s works for most
-        garden-variety storms, but a derecho or strong tornado needs
-        ±80+ to keep the deep reds/greens from saturating, while a
-        weak-shear day looks washed out at ±40 and benefits from
-        narrowing to ±20."""
+        scale to match the day's flow — default ±100 m/s matches the
+        RadarCope palette's full ±200-kt span so every band is on
+        screen at once; compress toward ±40 on weak-shear days to
+        amplify contrast in the central greens/reds."""
         vmax_ms = float(max(1.0, min(150.0, vmax_ms)))
         for panel in self._panels:
             panel._vel_vmax = vmax_ms
@@ -2390,6 +2425,20 @@ class RadarPanelGrid(QWidget):
             panel._cc_vmin = vmin
         if self._current_radar is not None and any(
             p.product == "CC" for p in self._panels
+        ):
+            self._render_all()
+
+    def set_vel_cmap(self, name: str) -> None:
+        """Switch the VEL colormap on every panel and re-render any VEL
+        panels currently displayed. ``name`` must be a matplotlib-
+        registered colormap — typically one of the entries in
+        :data:`VELOCITY_COLORMAP_CHOICES`."""
+        if not name:
+            return
+        for panel in self._panels:
+            panel._vel_cmap_name = name
+        if self._current_radar is not None and any(
+            p.product == "VEL" for p in self._panels
         ):
             self._render_all()
 
