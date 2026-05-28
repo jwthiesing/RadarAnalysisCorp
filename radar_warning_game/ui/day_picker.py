@@ -86,8 +86,11 @@ class DayPickerDialog(QDialog):
         # Replay toggle
         self._save_replay = QCheckBox("Save replay file", self)
 
-        # Team mode toggle
-        self._team_mode = QCheckBox("Enable team mode (pre-round team lobby)", self)
+        # Team-mode toggle was moved to HostRoomStatusDialog (plan §11
+        # "at room creation"). The day picker is solo + host post-room;
+        # by the time we get here in MP, peers are already connected
+        # and would miss the lobby announcement. Keeping the accessor
+        # below returning False for solo path compatibility.
 
         # Layout
         form = QFormLayout()
@@ -114,7 +117,6 @@ class DayPickerDialog(QDialog):
         layout.addWidget(self._live_radio)
         layout.addSpacing(12)
         layout.addWidget(self._save_replay)
-        layout.addWidget(self._team_mode)
         layout.addWidget(buttons)
 
         self._refresh_enabled()
@@ -152,4 +154,7 @@ class DayPickerDialog(QDialog):
         return self._save_replay.isChecked()
 
     def team_mode(self) -> bool:
-        return self._team_mode.isChecked()
+        # Stub kept so the existing call site in app.py compiles for
+        # solo runs. Team mode is host-only and set in
+        # :class:`HostRoomStatusDialog` — see plan §11.
+        return False

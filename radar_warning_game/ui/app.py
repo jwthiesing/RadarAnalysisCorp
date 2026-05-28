@@ -237,6 +237,10 @@ class MainWindow(QMainWindow):
         # wait — otherwise qasync hits a re-entrancy RuntimeError as
         # soon as the first WS frame arrives.
         if await self._async_exec(room_dlg) == QDialog.DialogCode.Accepted:
+            # Capture the host's team-mode choice now — the day picker
+            # used to expose this checkbox too, but team mode has to
+            # be set BEFORE peers see the round so the lobby can open.
+            self._team_mode = room_dlg.team_mode()
             self._show_day_picker()
 
     async def _begin_join_mode(self) -> None:
@@ -349,7 +353,12 @@ class MainWindow(QMainWindow):
             return
         self._day_picker_is_random = dlg.is_random()
         self._save_replay = dlg.save_replay()
-        self._team_mode = dlg.team_mode()
+        # Solo runs read team_mode from the day picker (returns False —
+        # solo team mode is meaningless). For host MP it's already been
+        # set from the HostRoomStatusDialog earlier in the flow; don't
+        # overwrite that here.
+        if not isinstance(self._multiplayer, MultiplayerHost):
+            self._team_mode = dlg.team_mode()
         self._is_live = dlg.is_live()
         self.statusBar().showMessage("Fetching reports…")
 

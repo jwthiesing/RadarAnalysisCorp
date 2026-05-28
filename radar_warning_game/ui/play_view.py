@@ -721,15 +721,41 @@ class PlayView(QWidget):
                   mcd_id)
 
     def _push_player_overlays(self) -> None:
-        """Hand the local player's warnings/MCDs to the radar grid so they
-        appear immediately after issuance/revision/cancel without waiting
-        for the next tick. Filtering to revisions-active-at-display-time
-        happens inside the grid's draw routine.
+        """Hand the local player's + their teammates' warnings/MCDs to
+        the radar grid so they appear immediately after issuance /
+        revision / cancel without waiting for the next tick.
+
+        Visibility rule (plan §11): a player sees their own warnings
+        plus those of teammates only. Opposing teams' warnings are
+        hidden on the per-player radar panel — they're visible on the
+        host central map (which is the host's view of the whole room).
+        Solo play degenerates correctly because the local player's
+        "team" is the synthetic solo-team-of-one and the union below
+        reduces to just their own warnings.
+
+        Filtering to revisions-active-at-display-time happens inside
+        the grid's draw routine.
         """
-        self.radar_grid.set_player_warnings(
-            self.session.warnings_by_player.get(self.local_player_id, []),
-            self.session.mcds_by_player.get(self.local_player_id, []),
-        )
+        team_ids = self._teammate_ids_including_self()
+        warnings: list = []
+        mcds: list = []
+        for pid in team_ids:
+            warnings.extend(self.session.warnings_by_player.get(pid, []))
+            mcds.extend(self.session.mcds_by_player.get(pid, []))
+        self.radar_grid.set_player_warnings(warnings, mcds)
+
+    def _teammate_ids_including_self(self) -> list[str]:
+        """All player ids on the same team as the local player, including
+        the local player themselves. Falls back to just the local id
+        when the player isn't yet bound to a team — happens briefly
+        between joining the room and the host's TeamRosterFreeze."""
+        me = self.session.players.get(self.local_player_id)
+        if me is None or me.team_id is None:
+            return [self.local_player_id]
+        members = self.session.teams.get(me.team_id, [])
+        if self.local_player_id not in members:
+            members = list(members) + [self.local_player_id]
+        return members
 
     def _toggle_inspector(self) -> None:
         """Keybind-driven inspector toggle. Reflects the new state back on

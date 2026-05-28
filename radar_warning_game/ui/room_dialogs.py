@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -154,6 +155,21 @@ class HostRoomStatusDialog(QDialog):
         self._peer_list = QListWidget(self)
         self._peer_list.addItem("(waiting for peers…)")
 
+        # Team-mode toggle lives here per plan §11 ("Host toggles team
+        # mode at room creation"). Selecting it after the day picker
+        # would be too late — peers need to know team mode is on
+        # before round setup so the lobby can open. The flag is read by
+        # app.py via :meth:`team_mode` when the dialog accepts.
+        self._team_mode = QCheckBox(
+            "Enable team mode (pre-round team lobby)", self,
+        )
+        self._team_mode.setToolTip(
+            "If checked, after this dialog the host runs a pre-round "
+            "team lobby where every player picks or creates a team. "
+            "Teammates' warnings are visible to each other; their "
+            "scores are aggregated into a single team total."
+        )
+
         continue_btn = QPushButton("Continue to Setup", self)
         continue_btn.clicked.connect(self.accept)
 
@@ -162,7 +178,11 @@ class HostRoomStatusDialog(QDialog):
         layout.addWidget(hint)
         layout.addWidget(QLabel("<b>Connected peers:</b>", self))
         layout.addWidget(self._peer_list)
+        layout.addWidget(self._team_mode)
         layout.addWidget(continue_btn)
+
+    def team_mode(self) -> bool:
+        return self._team_mode.isChecked()
 
     def add_peer(self, peer_id: str, name: str) -> None:
         # Strip the placeholder if present
