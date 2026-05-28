@@ -10,7 +10,7 @@ The player sits at a forecaster's desk: live-feeling radar data streams in from 
 
 ```bash
 # Clone, install, run
-git clone <this-repo>
+git clone https://github.com/jwthiesing/RadarAnalysisCorp
 cd RadarAnalysisCorp
 pip install -e .
 
