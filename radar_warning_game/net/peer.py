@@ -281,6 +281,11 @@ class ClientTransport:
         self._peer: _PeerConn | None = None
         self._sig_task: asyncio.Task | None = None
 
+    @property
+    def peer_id(self) -> str | None:
+        """Our own peer_id assigned by the signaling server at join time."""
+        return self._peer_id
+
     async def join(self, room_code: str) -> str:
         """Join an existing room. Returns this client's assigned peer_id."""
         self._session = aiohttp.ClientSession()

@@ -35,10 +35,18 @@ class PrefetchProgressWidget(QWidget):
 
     Signals
     -------
+    local_prefetch_done
+        emitted once every *populated* site this client downloads has
+        finished. Distinct from :attr:`ready_to_play` so the multiplayer
+        start-gate (plan §10) can intercept it — peers send a PeerReady
+        to the host and wait for the countdown to hit zero before
+        actually entering play. In solo / "Start anyway" paths the app
+        layer wires this straight through to ``ready_to_play``.
     ready_to_play
-        emitted when all *populated* sites have finished downloading (sites
-        with no archive data are excluded from the gate so they don't block
-        the round forever).
+        emitted when the round should actually begin — i.e. the gate has
+        released. Always wired to ``_enter_play`` by app.py. The widget
+        itself only emits this from the host's "Start anyway" button;
+        all other paths go through ``local_prefetch_done`` first.
     back_requested
         emitted when the user clicks the back/leave button. The
         appropriate parent behavior depends on ``is_peer``:
@@ -49,6 +57,7 @@ class PrefetchProgressWidget(QWidget):
         Always available so neither role is stuck on a misconfigured round.
     """
 
+    local_prefetch_done = pyqtSignal()
     ready_to_play = pyqtSignal()
     back_requested = pyqtSignal()
 
@@ -183,6 +192,9 @@ class PrefetchProgressWidget(QWidget):
         # host's downloads are done (or via ready_to_play). The button
         # would imply manual control they don't have.
         if not all_empty and not is_peer:
+            # "Start anyway" deliberately *bypasses* the multiplayer
+            # start-gate — host explicitly chose to begin regardless of
+            # peer readiness. Fire ``ready_to_play`` directly.
             self._skip_btn = QPushButton("Start anyway", self)
             self._skip_btn.clicked.connect(self.ready_to_play.emit)
             btn_row.addWidget(self._skip_btn)
@@ -225,7 +237,30 @@ class PrefetchProgressWidget(QWidget):
                 all_done = False
         if all_done and any_seen:
             self._timer.stop()
-            self.ready_to_play.emit()
+            self.local_prefetch_done.emit()
+
+    def set_countdown(self, seconds_remaining: int) -> None:
+        """Update the title to display the start-gate countdown.
+
+        Called from the multiplayer path when the host broadcasts each
+        ``RoundCountdown`` tick. Idempotent — set to the same value
+        twice just rerenders the same string. Counts down once, then
+        the parent calls ``ready_to_play.emit()`` separately to actually
+        enter play.
+        """
+        if seconds_remaining <= 0:
+            self._title.setText("Starting round…")
+        else:
+            self._title.setText(
+                f"Starting round in {seconds_remaining}s — radar prefetch continues"
+            )
+
+    def set_waiting_for_peers(self) -> None:
+        """Title-only update shown after local prefetch finishes but
+        before the gate threshold is met — i.e. we're waiting on other
+        clients to catch up. Replaced by ``set_countdown`` once the
+        host kicks off the timer."""
+        self._title.setText("Local prefetch complete — waiting for other clients…")
 
     def stop(self) -> None:
         self._timer.stop()

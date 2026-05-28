@@ -104,6 +104,19 @@ class TeamRosterFreeze:
 
 
 @dataclass(frozen=True)
+class TeamLobbyOpen:
+    """Host → peers: enter the pre-round team lobby.
+
+    Sent when the host has opted into team mode (plan §11) and reached the
+    lobby phase. Peers transition LOBBY → TEAM_LOBBY locally so their
+    waiting-room screen can swap to the :class:`TeamLobbyWidget`. The
+    lobby closes when a subsequent :class:`TeamRosterFreeze` arrives.
+    """
+
+    type: str = "TeamLobbyOpen"
+
+
+@dataclass(frozen=True)
 class WarningIssue:
     warning_id: str
     issuer_id: str
@@ -170,16 +183,48 @@ class Chat:
     type: str = "Chat"
 
 
+# Pre-game start-gate (plan §10 "Prefetch stall"). Peers signal readiness;
+# the host coordinates a countdown so the round starts in lockstep instead
+# of whenever each client's local prefetch happens to finish.
+@dataclass(frozen=True)
+class PeerReady:
+    """Peer → host: local pre-game prefetch is done; we're ready to play.
+
+    The host tallies these against its known peer set and, once enough
+    clients (75% threshold including the host) have reported in, starts
+    a fixed 60-second countdown broadcast to everyone via
+    :class:`RoundCountdown`.
+    """
+
+    player_id: str
+    type: str = "PeerReady"
+
+
+@dataclass(frozen=True)
+class RoundCountdown:
+    """Host → all peers: time remaining until the round begins.
+
+    Broadcast once per second. ``seconds_remaining == 0`` is the start
+    signal — when peers see it they enter play immediately. Re-broadcasts
+    are idempotent on the receive side: peers just overwrite their UI
+    countdown each tick.
+    """
+
+    seconds_remaining: int
+    type: str = "RoundCountdown"
+
+
 # ---------------------------- (de)serialization -------------------------------
 
 _TYPE_REGISTRY: dict[str, type] = {
     cls.__name__: cls for cls in (
         RoundSetup, Tick,
         PlayerJoin, PlayerLeave,
-        TeamCreate, TeamJoin, TeamLeave, TeamRosterFreeze,
+        TeamCreate, TeamJoin, TeamLeave, TeamRosterFreeze, TeamLobbyOpen,
         WarningIssue, WarningRevise, WarningCancel,
         MCDIssue, MCDCancel,
         Chat,
+        PeerReady, RoundCountdown,
     )
 }
 

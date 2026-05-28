@@ -263,15 +263,23 @@ class MainWindow(QMainWindow):
         placeholder = QWidget(self)
         pl = QVBoxLayout(placeholder)
         pl.addStretch(1)
-        msg = QLabel(
+        self._peer_waiting_label = QLabel(
             f"Joined room <b>{room_code}</b>. Waiting for host to start the round…",
             placeholder,
         )
-        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pl.addWidget(msg)
+        self._peer_waiting_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pl.addWidget(self._peer_waiting_label)
         pl.addStretch(1)
+        self._peer_waiting_widget = placeholder
         self._stack.addWidget(placeholder)
         self._stack.setCurrentWidget(placeholder)
+        # Wire the team-lobby hooks on the peer's multiplayer wrapper.
+        # When the host opens the team lobby we swap in the lobby
+        # widget; when the host freezes the roster we swap back to the
+        # waiting screen until RoundSetup arrives.
+        mp_peer = self._multiplayer
+        mp_peer.on_team_lobby_open = self._show_team_lobby_peer
+        mp_peer.on_team_roster_freeze = self._on_peer_roster_frozen
         # Poll for the RoundSetup message to arrive (it sets round_config on the session)
         for _ in range(600):  # up to 5 minutes
             await asyncio.sleep(0.5)
@@ -289,7 +297,12 @@ class MainWindow(QMainWindow):
         # straight from LOBBY and raise IllegalStateTransition (the
         # transition table only allows PREFETCH → PLAYING).
         cfg = self.session.round_config
-        self.session.freeze_roster()        # LOBBY → SETUP
+        # If team mode ran, the TeamRosterFreeze applier already pulled
+        # the session into SETUP; calling ``freeze_roster`` a second
+        # time would attempt a SETUP→SETUP self-transition and raise.
+        from ..game.session import SessionState
+        if self.session.state == SessionState.LOBBY:
+            self.session.freeze_roster()    # LOBBY → SETUP
         self.session.begin_prefetch()       # SETUP → PREFETCH
         self._prefetcher = Prefetcher(list(cfg.radar_sites), self._cache)
         self._prefetcher.schedule_pregame(cfg.time_start, cfg.time_end)
@@ -304,6 +317,24 @@ class MainWindow(QMainWindow):
         self._prefetch_progress.back_requested.connect(
             self._on_peer_leave_room
         )
+        # Hook the peer into the start-gate (plan §10). Local prefetch
+        # finishing fires ``PeerReady`` to the host; we then wait for the
+        # countdown ticks the host broadcasts, and enter play only when
+        # it hits zero. If we're somehow not the MultiplayerPeer wrapper
+        # (shouldn't happen on this code path, but defensive), fall back
+        # to entering play directly once local prefetch is done.
+        if isinstance(self._multiplayer, MultiplayerPeer):
+            mp = self._multiplayer
+            self._prefetch_progress.local_prefetch_done.connect(
+                lambda: (mp.mark_peer_ready(),
+                         self._prefetch_progress.set_waiting_for_peers())
+            )
+            mp.on_countdown = self._prefetch_progress.set_countdown
+            mp.on_round_start = self._prefetch_progress.ready_to_play.emit
+        else:
+            self._prefetch_progress.local_prefetch_done.connect(
+                self._prefetch_progress.ready_to_play.emit
+            )
         self._stack.addWidget(self._prefetch_progress)
         self._stack.setCurrentWidget(self._prefetch_progress)
 
@@ -350,6 +381,16 @@ class MainWindow(QMainWindow):
     def _on_day_fetched(self, day: RoundDay) -> None:
         self._round_day = day
         log.info("Day fetched: %d reports (random=%s)", len(day.reports), day.is_random)
+        # In team mode the host needs to run the pre-round team lobby
+        # before picking polygon/radars — peers can't join teams once
+        # the round has started, so this has to happen first. Solo and
+        # non-team-mode runs skip straight to the overview map.
+        if self._team_mode and isinstance(self._multiplayer, MultiplayerHost):
+            self._show_team_lobby_host()
+            return
+        self._show_overview_map(day)
+
+    def _show_overview_map(self, day: RoundDay) -> None:
         self.statusBar().showMessage(
             f"{len(day.reports)} reports loaded — pick game polygon + active radars"
         )
@@ -363,6 +404,103 @@ class MainWindow(QMainWindow):
         self._overview_map.continue_requested.connect(self._continue_to_time)
         self._stack.addWidget(self._overview_map)
         self._stack.setCurrentWidget(self._overview_map)
+
+    def _show_team_lobby_host(self) -> None:
+        """Open the pre-round team lobby on the host (plan §11).
+
+        Broadcasts TeamLobbyOpen so connected peers swap their waiting
+        screen for the same widget, then wires every team-lobby signal
+        to the multiplayer broadcaster. The "Start round (freeze teams)"
+        button hands off to the overview map.
+        """
+        from .team_lobby import TeamLobbyWidget
+        if not isinstance(self._multiplayer, MultiplayerHost):
+            return
+        mp = self._multiplayer
+        # Transition + broadcast must happen before showing the widget
+        # so the widget's first refresh reads a session in TEAM_LOBBY.
+        asyncio.ensure_future(mp.announce_team_lobby())
+        self._team_lobby = TeamLobbyWidget(
+            self.session, self.local_player_id, host_mode=True, parent=self,
+        )
+        self._team_lobby.request_create_team.connect(
+            lambda name: asyncio.ensure_future(mp.create_team(name))
+        )
+        self._team_lobby.request_join_team.connect(
+            lambda tid: asyncio.ensure_future(mp.join_team(tid))
+        )
+        self._team_lobby.request_leave_team.connect(
+            lambda: asyncio.ensure_future(mp.leave_team())
+        )
+        self._team_lobby.request_move_player.connect(
+            lambda pid, tid: asyncio.ensure_future(mp.move_player(pid, tid))
+        )
+        self._team_lobby.request_freeze_roster.connect(
+            self._on_host_freeze_roster
+        )
+        # Wire-applied team changes from peers should refresh the widget.
+        mp.on_team_state_changed = self._team_lobby.refresh
+        self._stack.addWidget(self._team_lobby)
+        self._stack.setCurrentWidget(self._team_lobby)
+        self.statusBar().showMessage(
+            "Team lobby — form teams, then click 'Start round (freeze teams)'"
+        )
+
+    def _on_host_freeze_roster(self) -> None:
+        if not isinstance(self._multiplayer, MultiplayerHost):
+            return
+        mp = self._multiplayer
+        asyncio.ensure_future(mp.broadcast_team_roster_freeze())
+        # Clear the lobby's refresh hook so a late-arriving wire team
+        # message doesn't try to mutate a widget we've torn down.
+        mp.on_team_state_changed = None
+        if self._round_day is not None:
+            self._show_overview_map(self._round_day)
+
+    def _show_team_lobby_peer(self) -> None:
+        """Host announced the team lobby — swap our waiting screen for
+        the :class:`TeamLobbyWidget`. Wired by :attr:`MultiplayerPeer.on_team_lobby_open`.
+
+        Peer's widget gets ``host_mode=False`` so the move-player /
+        freeze-roster buttons are hidden. Local-only mutations (create,
+        join, leave) go through the multiplayer wrapper, which sends to
+        the host and the host re-broadcasts to other peers.
+        """
+        from .team_lobby import TeamLobbyWidget
+        if not isinstance(self._multiplayer, MultiplayerPeer):
+            return
+        mp = self._multiplayer
+        self._team_lobby = TeamLobbyWidget(
+            self.session, self.local_player_id, host_mode=False, parent=self,
+        )
+        self._team_lobby.request_create_team.connect(
+            lambda name: asyncio.ensure_future(mp.create_team(name))
+        )
+        self._team_lobby.request_join_team.connect(
+            lambda tid: asyncio.ensure_future(mp.join_team(tid))
+        )
+        self._team_lobby.request_leave_team.connect(
+            lambda: asyncio.ensure_future(mp.leave_team())
+        )
+        mp.on_team_state_changed = self._team_lobby.refresh
+        self._stack.addWidget(self._team_lobby)
+        self._stack.setCurrentWidget(self._team_lobby)
+        self.statusBar().showMessage(
+            "Team lobby — pick or create your team; host will start the round"
+        )
+
+    def _on_peer_roster_frozen(self) -> None:
+        """Host froze the roster — drop the lobby widget and go back to
+        the waiting screen until RoundSetup arrives. The session has
+        already transitioned out of TEAM_LOBBY via the applier."""
+        if not isinstance(self._multiplayer, MultiplayerPeer):
+            return
+        self._multiplayer.on_team_state_changed = None
+        if self._peer_waiting_widget is not None:
+            self._peer_waiting_label.setText(
+                "Teams frozen — waiting for the host to finish round setup…"
+            )
+            self._stack.setCurrentWidget(self._peer_waiting_widget)
 
     def _on_polygon_changed(self, polygon) -> None:
         if polygon is not None:
@@ -455,8 +593,24 @@ class MainWindow(QMainWindow):
             mode=RoundMode.LIVE if getattr(self, "_is_live", False) else RoundMode.HISTORICAL,
         )
         self.session.set_round(self._round_day, config)
-        self.session.freeze_roster()
+        # Team mode already drove the session out of LOBBY (via
+        # TeamRosterFreeze) into SETUP; calling freeze_roster() again
+        # would attempt a SETUP→SETUP self-transition.
+        from ..game.session import SessionState
+        if self.session.state == SessionState.LOBBY:
+            self.session.freeze_roster()
         self.session.begin_prefetch()
+
+        # Announce the round to peers NOW (at the start of prefetch) so
+        # their downloads run in parallel with ours. Previously this
+        # broadcast lived in ``_enter_play`` — i.e. fired only after the
+        # host's own prefetch had already finished — which serialized
+        # the two clients' downloads and left peers staring at "waiting
+        # for host" while the host quietly played a several-minute head
+        # start of radar data. Solo runs (no multiplayer object) and
+        # peer runs (MultiplayerPeer, not Host) skip this branch.
+        if isinstance(self._multiplayer, MultiplayerHost):
+            asyncio.ensure_future(self._multiplayer.announce_round_setup())
 
         # Kick off the prefetcher (live mode uses the IEM live source, not S3)
         is_live = config.mode == RoundMode.LIVE
@@ -468,6 +622,24 @@ class MainWindow(QMainWindow):
         self._prefetch_progress.back_requested.connect(
             self._on_prefetch_back_requested
         )
+        # Wire the multiplayer start-gate (plan §10). In solo there's no
+        # gate — local prefetch finishing flows straight into play. With
+        # a MultiplayerHost we tell the gate the host is ready; the gate
+        # waits until ≥75% of clients are ready, runs a 60s countdown,
+        # then calls back to actually enter play.
+        if isinstance(self._multiplayer, MultiplayerHost):
+            mp = self._multiplayer
+            self._prefetch_progress.local_prefetch_done.connect(
+                lambda: (mp.mark_host_ready(),
+                         self._prefetch_progress.set_waiting_for_peers())
+            )
+            mp.on_countdown = self._prefetch_progress.set_countdown
+            mp.on_round_start = self._prefetch_progress.ready_to_play.emit
+        else:
+            # Solo path: local prefetch done == ready to play.
+            self._prefetch_progress.local_prefetch_done.connect(
+                self._prefetch_progress.ready_to_play.emit
+            )
         self._stack.addWidget(self._prefetch_progress)
         self._stack.setCurrentWidget(self._prefetch_progress)
         self.statusBar().showMessage("Downloading radar volumes…")
@@ -576,9 +748,9 @@ class MainWindow(QMainWindow):
                 ))
                 log.info("Clock snapped to first available sweep at %s",
                          earliest.strftime("%H:%M:%SZ"))
-        # If we're hosting, announce the round to peers now (before play view exists).
-        if isinstance(self._multiplayer, MultiplayerHost):
-            asyncio.ensure_future(self._multiplayer.announce_round_setup())
+        # Round setup was already announced to peers when prefetch
+        # started — see the begin_prefetch path. Re-broadcasting here
+        # would just churn the wire.
         self._play_view = PlayView(
             session=self.session,
             prefetcher=self._prefetcher,

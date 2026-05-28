@@ -97,19 +97,47 @@ class _SessionApplier:
     def _apply_player_leave(self, msg: proto.PlayerLeave) -> None:
         self.session.remove_player(msg.player_id)
 
+    def _fire_team_changed(self) -> None:
+        """Notify the UI that the team roster changed. Subclasses set
+        ``on_team_state_changed`` to a no-arg callable; the base mixin
+        leaves it as None so unit tests of the applier work without
+        wiring the hook."""
+        cb = getattr(self, "on_team_state_changed", None)
+        if cb is not None:
+            try:
+                cb()
+            except Exception:  # noqa: BLE001
+                log.exception("on_team_state_changed callback raised")
+
+    def _apply_team_lobby_open(self, msg: proto.TeamLobbyOpen) -> None:
+        # Idempotent — if a duplicate or out-of-order TeamLobbyOpen
+        # arrives we just stay in TEAM_LOBBY without re-transitioning.
+        from ..game.session import SessionState
+        if self.session.state == SessionState.LOBBY:
+            self.session.enter_team_lobby()
+        cb = getattr(self, "on_team_lobby_open", None)
+        if cb is not None:
+            try:
+                cb()
+            except Exception:  # noqa: BLE001
+                log.exception("on_team_lobby_open callback raised")
+
     def _apply_team_create(self, msg: proto.TeamCreate) -> None:
         self.session.teams.setdefault(msg.team_id, [])
         self.session.team_names[msg.team_id] = msg.name
         if msg.creator_id in self.session.players:
             self.session.join_team(msg.creator_id, msg.team_id)
+        self._fire_team_changed()
 
     def _apply_team_join(self, msg: proto.TeamJoin) -> None:
         if msg.player_id in self.session.players and msg.team_id in self.session.teams:
             self.session.join_team(msg.player_id, msg.team_id)
+        self._fire_team_changed()
 
     def _apply_team_leave(self, msg: proto.TeamLeave) -> None:
         if msg.player_id in self.session.players:
             self.session.leave_team(msg.player_id)
+        self._fire_team_changed()
 
     def _apply_team_roster_freeze(self, msg: proto.TeamRosterFreeze) -> None:
         self.session.teams.clear()
@@ -121,6 +149,13 @@ class _SessionApplier:
                 if pid in self.session.players:
                     self.session.players[pid].team_id = tid
         self.session.freeze_roster()
+        self._fire_team_changed()
+        cb = getattr(self, "on_team_roster_freeze", None)
+        if cb is not None:
+            try:
+                cb()
+            except Exception:  # noqa: BLE001
+                log.exception("on_team_roster_freeze callback raised")
 
     def _apply_warning_issue(self, msg: proto.WarningIssue) -> None:
         # Skip if we already have this warning (echo of our own send)
@@ -223,6 +258,23 @@ class MultiplayerHost(_SessionApplier):
         # Outstanding relay tasks; keep refs so the garbage collector doesn't
         # cancel them mid-flight (Python 3.13 warns and may drop messages).
         self._relay_tasks: set[asyncio.Task] = set()
+        # Pre-game start gate (plan §10): collect PeerReady votes from
+        # connected peers; once threshold reached AND host is ready,
+        # broadcast a 60-second RoundCountdown then call
+        # ``on_round_start``. Solo / no-peer setups skip the gate and
+        # start instantly.
+        self._ready_peer_ids: set[str] = set()
+        self._host_ready: bool = False
+        self._countdown_task: asyncio.Task | None = None
+        self._round_started: bool = False
+        self.on_round_start: Any = None       # () -> None — set by the UI
+        # Team-lobby (plan §11) UI hooks: fired after a wire team op is
+        # applied or a local team op is performed. The UI sets these to
+        # refresh the team-lobby widget. The host's own actions also
+        # call ``_fire_team_changed`` for symmetry so the widget can
+        # use a single refresh entry point.
+        self.on_team_state_changed: Any = None    # () -> None
+        self.on_team_roster_freeze: Any = None    # () -> None
         transport.on_message = self._on_peer_message
         transport.on_peer_joined = self._on_peer_joined
         transport.on_peer_left = self._on_peer_left
@@ -244,6 +296,12 @@ class MultiplayerHost(_SessionApplier):
     def _on_peer_left(self, peer_id: str) -> None:
         if peer_id in self.session.players:
             self.session.remove_player(peer_id)
+        # A departing peer can never become "ready" — drop them from the
+        # gate's vote set so the remaining clients' ratio isn't dragged
+        # down by ghosts. If their absence now pushes us over the
+        # threshold, fire the gate check.
+        self._ready_peer_ids.discard(peer_id)
+        self._maybe_start_countdown()
         asyncio.ensure_future(self._broadcast(proto.PlayerLeave(player_id=peer_id)))
 
     async def _send_snapshot_to(self, peer_id: str) -> None:
@@ -321,6 +379,143 @@ class MultiplayerHost(_SessionApplier):
             save_replay=cfg.save_replay,
         )
         await self.transport.broadcast(proto.encode(msg))
+
+    # ---- team lobby (plan §11) -----------------------------------------
+
+    async def announce_team_lobby(self) -> None:
+        """Tell peers the host has entered the pre-round team lobby.
+
+        Idempotent on receivers — applying TeamLobbyOpen twice is a no-op.
+        The local session also transitions if it hasn't already.
+        """
+        from ..game.session import SessionState
+        if self.session.state == SessionState.LOBBY:
+            self.session.enter_team_lobby()
+        await self.transport.broadcast(proto.encode(proto.TeamLobbyOpen()))
+
+    async def create_team(self, name: str, creator_id: str | None = None) -> str:
+        """Create a team locally and broadcast TeamCreate.
+
+        ``creator_id`` defaults to the host's own player id, so a host
+        clicking "Create team…" winds up in their own new team.
+        """
+        creator = creator_id or self.host_player_id
+        tid = self.session.create_team(name, creator)
+        self._fire_team_changed()
+        await self.transport.broadcast(proto.encode(proto.TeamCreate(
+            team_id=tid, name=name, creator_id=creator,
+        )))
+        return tid
+
+    async def join_team(self, team_id: str, player_id: str | None = None) -> None:
+        pid = player_id or self.host_player_id
+        self.session.join_team(pid, team_id)
+        self._fire_team_changed()
+        await self.transport.broadcast(proto.encode(proto.TeamJoin(
+            team_id=team_id, player_id=pid,
+        )))
+
+    async def leave_team(self, player_id: str | None = None) -> None:
+        pid = player_id or self.host_player_id
+        self.session.leave_team(pid)
+        self._fire_team_changed()
+        await self.transport.broadcast(proto.encode(proto.TeamLeave(player_id=pid)))
+
+    async def move_player(self, player_id: str, target_team_id: str) -> None:
+        """Host admin: move ``player_id`` into ``target_team_id``. An empty
+        string for ``target_team_id`` returns the player to unassigned
+        (solo)."""
+        if not target_team_id:
+            await self.leave_team(player_id=player_id)
+        else:
+            await self.join_team(team_id=target_team_id, player_id=player_id)
+
+    async def broadcast_team_roster_freeze(self) -> None:
+        """Snapshot the current roster, lock it, and broadcast to peers.
+
+        Called when the host clicks "Start round (freeze teams)" — pushes
+        the session out of TEAM_LOBBY into SETUP and stops further team
+        edits.
+        """
+        roster = {tid: list(members) for tid, members in self.session.teams.items()}
+        names = dict(self.session.team_names)
+        self.session.freeze_roster()
+        await self.transport.broadcast(proto.encode(proto.TeamRosterFreeze(
+            roster=roster, team_names=names,
+        )))
+        self._fire_team_changed()
+
+    # ---- pre-game start gate (plan §10) -------------------------------
+
+    READY_THRESHOLD = 0.75          # fraction of clients needed before countdown
+    COUNTDOWN_SECONDS = 60          # length of countdown once threshold hit
+
+    def mark_host_ready(self) -> None:
+        """Called by the host UI when its own pre-game prefetch finishes.
+
+        If the threshold is already met (or no peers are connected — solo
+        play / nobody-joined-yet host), this also kicks off the countdown
+        (or, for the no-peers case, fires ``on_round_start`` immediately).
+        """
+        if self._host_ready:
+            return
+        self._host_ready = True
+        self._maybe_start_countdown()
+
+    def _apply_peer_ready(self, msg: proto.PeerReady) -> None:
+        if msg.player_id in self._ready_peer_ids:
+            return
+        self._ready_peer_ids.add(msg.player_id)
+        self._maybe_start_countdown()
+
+    def _maybe_start_countdown(self) -> None:
+        if self._countdown_task is not None or self._round_started:
+            return
+        if not self._host_ready:
+            return
+        peer_ids = set(self.transport.peer_ids)
+        total_clients = 1 + len(peer_ids)
+        # If no peers are connected, skip the gate — there's nothing to
+        # coordinate. Host plays solo (or simply starts ahead of any
+        # late joiner, which is fine: late joiners get mid-round-join
+        # treatment per plan §4).
+        if not peer_ids:
+            self._round_started = True
+            self._fire_round_start()
+            return
+        ready_peers = self._ready_peer_ids & peer_ids
+        ready_count = 1 + len(ready_peers)
+        # ``≥75%`` (plan §10). For 2 clients (host+1) this is effectively
+        # "both ready" (ceil(1.5) = 2); for 4 it's 3 of 4.
+        import math
+        need = math.ceil(self.READY_THRESHOLD * total_clients)
+        if ready_count >= need:
+            self._countdown_task = asyncio.ensure_future(self._run_countdown())
+
+    async def _run_countdown(self) -> None:
+        """Broadcast RoundCountdown(60), (59), ..., (0), then call
+        on_round_start. Always sends the trailing 0 so peers have an
+        unambiguous start signal."""
+        try:
+            for n in range(self.COUNTDOWN_SECONDS, -1, -1):
+                await self.transport.broadcast(
+                    proto.encode(proto.RoundCountdown(seconds_remaining=n))
+                )
+                if n == 0:
+                    break
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            return
+        self._round_started = True
+        self._fire_round_start()
+
+    def _fire_round_start(self) -> None:
+        cb = self.on_round_start
+        if cb is not None:
+            try:
+                cb()
+            except Exception:  # noqa: BLE001
+                log.exception("on_round_start callback raised")
 
     async def broadcast_tick(self, tick: TickState) -> None:
         if self.round_epoch is None:
@@ -401,7 +596,88 @@ class MultiplayerPeer(_SessionApplier):
         self.session = session
         self.transport = transport
         self.round_epoch: datetime | None = None
+        # Pre-game start-gate hooks for the peer side. The peer UI calls
+        # ``mark_peer_ready`` once its own prefetch finishes; later the
+        # host broadcasts RoundCountdown messages, which we surface via
+        # ``on_countdown`` (per-tick) and ``on_round_start`` (when the
+        # 0-tick arrives).
+        self.on_countdown: Any = None         # (seconds_remaining: int) -> None
+        self.on_round_start: Any = None       # () -> None
+        # Team-lobby hooks (plan §11). The UI uses these to swap to /
+        # from the TeamLobbyWidget and refresh its roster.
+        self.on_team_lobby_open: Any = None       # () -> None
+        self.on_team_roster_freeze: Any = None    # () -> None
+        self.on_team_state_changed: Any = None    # () -> None
+        self._sent_ready: bool = False
+        self._round_started: bool = False
         transport.on_message = self._on_host_message
+
+    # ---- team lobby (plan §11) -----------------------------------------
+
+    async def create_team(self, name: str) -> str:
+        """Locally create the team and send TeamCreate to the host.
+
+        The host re-broadcasts to other peers and applies to its own
+        session, which echoes back to us — but our applier is keyed on
+        ``team_id`` and is idempotent, so the echo is harmless.
+        """
+        if self.transport.peer_id is None:
+            raise RuntimeError("Peer not yet assigned an id (joined?)")
+        tid = self.session.create_team(name, self.transport.peer_id)
+        self._fire_team_changed()
+        await self.transport.send(proto.encode(proto.TeamCreate(
+            team_id=tid, name=name, creator_id=self.transport.peer_id,
+        )))
+        return tid
+
+    async def join_team(self, team_id: str) -> None:
+        if self.transport.peer_id is None:
+            raise RuntimeError("Peer not yet assigned an id")
+        self.session.join_team(self.transport.peer_id, team_id)
+        self._fire_team_changed()
+        await self.transport.send(proto.encode(proto.TeamJoin(
+            team_id=team_id, player_id=self.transport.peer_id,
+        )))
+
+    async def leave_team(self) -> None:
+        if self.transport.peer_id is None:
+            raise RuntimeError("Peer not yet assigned an id")
+        self.session.leave_team(self.transport.peer_id)
+        self._fire_team_changed()
+        await self.transport.send(proto.encode(proto.TeamLeave(
+            player_id=self.transport.peer_id,
+        )))
+
+    def mark_peer_ready(self) -> None:
+        """Tell the host our local prefetch is done. Idempotent — calling
+        twice does nothing. The peer keeps showing its prefetch / waiting
+        screen until the host's RoundCountdown reaches 0.
+        """
+        if self._sent_ready:
+            return
+        self._sent_ready = True
+        asyncio.ensure_future(self.transport.send(
+            proto.encode(proto.PeerReady(player_id=self.transport.peer_id))
+        ))
+
+    def _apply_round_countdown(self, msg: proto.RoundCountdown) -> None:
+        if self._round_started:
+            return
+        n = int(msg.seconds_remaining)
+        cb = self.on_countdown
+        if cb is not None:
+            try:
+                cb(n)
+            except Exception:  # noqa: BLE001
+                log.exception("on_countdown callback raised")
+        if n <= 0:
+            self._round_started = True
+            cb2 = self.on_round_start
+            if cb2 is not None:
+                try:
+                    cb2()
+                except Exception:  # noqa: BLE001
+                    log.exception("on_round_start callback raised")
 
     async def issue_warning(self, **kwargs) -> Warning:
         w = self.session.issue_warning(**kwargs)
