@@ -210,9 +210,28 @@ class MainWindow(QMainWindow):
         self._multiplayer = MultiplayerHost(self.session, self._host_transport)
         # Show room-status dialog; host clicks "Continue to Setup" when ready
         room_dlg = HostRoomStatusDialog(room_code, self)
-        # Hook the peer-joined callback to update the dialog list
-        self._host_transport._on_peer_joined = lambda pid: room_dlg.add_peer(pid, pid)
-        self._host_transport._on_peer_left = lambda pid: room_dlg.remove_peer(pid)
+        # Chain dialog updates onto the MultiplayerHost-installed callbacks
+        # rather than overwriting them — MP needs its own handler to run
+        # to onboard the new peer (add_player + send snapshot), but the
+        # status dialog also needs to know to update its list. Note the
+        # attribute names lack a leading underscore; an earlier version
+        # of this code assigned to ``_on_peer_joined`` (typo) which
+        # silently did nothing.
+        mp_joined = self._host_transport.on_peer_joined
+        mp_left = self._host_transport.on_peer_left
+
+        def _peer_joined(pid: str, _mp=mp_joined) -> None:
+            if _mp is not None:
+                _mp(pid)
+            room_dlg.add_peer(pid, pid)
+
+        def _peer_left(pid: str, _mp=mp_left) -> None:
+            if _mp is not None:
+                _mp(pid)
+            room_dlg.remove_peer(pid)
+
+        self._host_transport.on_peer_joined = _peer_joined
+        self._host_transport.on_peer_left = _peer_left
         # Use _async_exec (not dlg.exec()) so the signaling_loop task we
         # started in HostTransport.start() can keep ticking while we
         # wait — otherwise qasync hits a re-entrancy RuntimeError as
@@ -263,10 +282,15 @@ class MainWindow(QMainWindow):
                                 "Host didn't start a round in time. Returning to mode selection.")
             self.close()
             return
-        # Peer skips polygon/time setup — config came from the wire. Go straight to prefetch.
+        # Peer skips polygon/time setup — config came from the wire. Walk
+        # the same state machine the host uses: LOBBY → SETUP → PREFETCH.
+        # The PLAYING transition happens later in ``_enter_play`` when
+        # the prefetch finishes; calling ``begin_play`` here would jump
+        # straight from LOBBY and raise IllegalStateTransition (the
+        # transition table only allows PREFETCH → PLAYING).
         cfg = self.session.round_config
-        self.session.clock = GameClock(cfg.time_start, cfg.time_end)
-        self.session.begin_play()           # peer's session is now PLAYING
+        self.session.freeze_roster()        # LOBBY → SETUP
+        self.session.begin_prefetch()       # SETUP → PREFETCH
         self._prefetcher = Prefetcher(list(cfg.radar_sites), self._cache)
         self._prefetcher.schedule_pregame(cfg.time_start, cfg.time_end)
         # is_peer=True swaps "Back to radar selection" → "Leave room" and

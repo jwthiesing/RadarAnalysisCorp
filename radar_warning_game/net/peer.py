@@ -53,6 +53,52 @@ log = logging.getLogger(__name__)
 
 DEFAULT_SIGNALING_URL = "ws://localhost:8765/ws"
 
+
+def normalize_signaling_url(url: str) -> str:
+    """Auto-bracket a raw IPv6 host in a ``ws://...`` URL.
+
+    URL parsers require IPv6 literals to be wrapped in ``[...]`` so the
+    colons in the address aren't confused with the host/port separator.
+    Users who paste a raw address like
+    ``ws://2600:1700:bb50:c070::1:8765/ws`` end up with the trailing
+    ``:1:8765/ws`` getting mis-parsed (the URL library can't tell which
+    colon is the port). Detect that case and insert the brackets.
+
+    Inputs that already look correct (hostnames, IPv4, or properly
+    bracketed IPv6) are passed through unchanged.
+    """
+    s = url.strip()
+    if not s:
+        return s
+    scheme = ""
+    rest = s
+    if "://" in s:
+        scheme, rest = s.split("://", 1)
+        scheme += "://"
+    # Already bracketed → trust it.
+    if rest.startswith("["):
+        return scheme + rest
+    # Split off path so we only look at host:port.
+    if "/" in rest:
+        hostport, path = rest.split("/", 1)
+        path = "/" + path
+    else:
+        hostport, path = rest, ""
+    # Raw IPv6 literals contain at least two colons (an IPv4 has at most
+    # one — the port separator). Bracket the host portion, treating the
+    # *last* colon as the port separator if it's followed by digits only.
+    if hostport.count(":") >= 2:
+        last_colon = hostport.rfind(":")
+        tail = hostport[last_colon + 1:]
+        if tail.isdigit():
+            host = hostport[:last_colon]
+            port = ":" + tail
+        else:
+            host = hostport
+            port = ""
+        hostport = f"[{host}]{port}"
+    return scheme + hostport + path
+
 # Message handler: callable(peer_id, raw_str) -> None
 MessageHandler = Callable[[str, str], None]
 PeerEventHandler = Callable[[str], None]   # peer_id

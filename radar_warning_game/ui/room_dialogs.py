@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..net.peer import DEFAULT_SIGNALING_URL
+from ..net.peer import DEFAULT_SIGNALING_URL, normalize_signaling_url
 
 
 class ModeDialog(QDialog):
@@ -84,7 +84,8 @@ class ModeDialog(QDialog):
         return self._name_edit.text().strip() or "Player"
 
     def signaling_url(self) -> str:
-        return self._sig_url_edit.text().strip() or DEFAULT_SIGNALING_URL
+        raw = self._sig_url_edit.text().strip() or DEFAULT_SIGNALING_URL
+        return normalize_signaling_url(raw)
 
 
 class JoinRoomDialog(QDialog):

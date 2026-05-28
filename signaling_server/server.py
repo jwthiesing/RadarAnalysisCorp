@@ -207,11 +207,21 @@ def build_app() -> web.Application:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="0.0.0.0")
+    # Dual-stack by default: a comma-separated list passed to aiohttp
+    # binds to multiple addresses. 0.0.0.0 covers all IPv4 interfaces;
+    # :: covers all IPv6. Without the IPv6 bind a friend connecting via
+    # the host's public IPv6 silently fails because nothing is
+    # listening on that family.
+    parser.add_argument(
+        "--host", default="0.0.0.0,::",
+        help="comma-separated list of bind addresses (default: dual-stack)",
+    )
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     app = build_app()
-    web.run_app(app, host=args.host, port=args.port)
+    hosts = [h.strip() for h in args.host.split(",") if h.strip()]
+    web.run_app(app, host=hosts if len(hosts) > 1 else hosts[0],
+                port=args.port)
     return 0
 
 
