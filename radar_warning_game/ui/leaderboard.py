@@ -24,12 +24,15 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from ..game.session import GameSession
 from ..verification.scoring import TeamScore
 from .colors import color_for_team
+from .recap_map import RecapMap
 from .time_format import format_player_offset
 
 
@@ -113,12 +116,14 @@ class FinalLeaderboardDialog(QDialog):
         location_reveal: str | None = None,
         event_url: str | None = None,
         replay_path: str | None = None,
+        session: GameSession | None = None,
+        local_player_id: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Round complete")
         self.setModal(True)
-        self.resize(900, 600)
+        self.resize(1100, 700)
 
         # Reveal banner
         banner_parts = ["<b>Round complete</b>"]
@@ -165,13 +170,27 @@ class FinalLeaderboardDialog(QDialog):
                 table.setItem(row, col, item)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
 
+        # Tabs: scores table + recap map. Recap is only available when
+        # the caller passes us a session; offline / test invocations
+        # that just want the table can omit it and we fall through to
+        # a single-pane layout.
+        tabs = QTabWidget(self)
+        scores_tab = QWidget(self)
+        scores_layout = QVBoxLayout(scores_tab)
+        scores_layout.setContentsMargins(0, 0, 0, 0)
+        scores_layout.addWidget(table)
+        tabs.addTab(scores_tab, "Scores")
+        if session is not None and local_player_id is not None:
+            tabs.addTab(RecapMap(session, local_player_id, parent=self),
+                         "Your warnings")
+
         # Close button
         close = QPushButton("Close", self)
         close.clicked.connect(self.accept)
 
         layout = QVBoxLayout(self)
         layout.addWidget(banner)
-        layout.addWidget(table, stretch=1)
+        layout.addWidget(tabs, stretch=1)
         if replay_path:
             replay_label = QLabel(
                 f"<i>Replay saved to:</i> <a href='file://{replay_path}'>{replay_path}</a>",

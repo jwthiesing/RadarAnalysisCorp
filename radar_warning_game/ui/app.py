@@ -583,6 +583,8 @@ class MainWindow(QMainWindow):
             location_reveal=f"{reveal.name} — {reveal.location}" if reveal else None,
             event_url=reveal.url if reveal else None,
             replay_path=getattr(self, "_replay_path", None),
+            session=self.session,
+            local_player_id=self.local_player_id,
             parent=self,
         )
         dlg.exec()
