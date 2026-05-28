@@ -635,9 +635,19 @@ class MainWindow(QMainWindow):
             )
             mp.on_countdown = self._prefetch_progress.set_countdown
             mp.on_round_start = self._prefetch_progress.ready_to_play.emit
+            # "Start anyway" routes through the gate so peers get a
+            # RoundCountdown(0) start signal too — otherwise the host
+            # walks into the game alone and peers stare at "waiting…".
+            self._prefetch_progress.force_start_requested.connect(
+                mp.force_start_round
+            )
         else:
-            # Solo path: local prefetch done == ready to play.
+            # Solo path: local prefetch done == ready to play, and
+            # "Start anyway" is just an early ready_to_play.
             self._prefetch_progress.local_prefetch_done.connect(
+                self._prefetch_progress.ready_to_play.emit
+            )
+            self._prefetch_progress.force_start_requested.connect(
                 self._prefetch_progress.ready_to_play.emit
             )
         self._stack.addWidget(self._prefetch_progress)

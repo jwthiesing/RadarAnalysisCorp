@@ -485,12 +485,46 @@ class MultiplayerHost(_SessionApplier):
             return
         ready_peers = self._ready_peer_ids & peer_ids
         ready_count = 1 + len(ready_peers)
+        # 100%-ready shortcut: there are no stragglers to wait on, so
+        # the 60-second countdown is pure dead time. Send a single
+        # ``RoundCountdown(0)`` so peers still get an unambiguous start
+        # signal, then fire on_round_start.
+        if ready_count >= total_clients:
+            self._countdown_task = asyncio.ensure_future(self._fast_start())
+            return
         # ``≥75%`` (plan §10). For 2 clients (host+1) this is effectively
         # "both ready" (ceil(1.5) = 2); for 4 it's 3 of 4.
         import math
         need = math.ceil(self.READY_THRESHOLD * total_clients)
         if ready_count >= need:
             self._countdown_task = asyncio.ensure_future(self._run_countdown())
+
+    async def _fast_start(self) -> None:
+        """100%-ready / forced-start path: broadcast RoundCountdown(0)
+        once and fire on_round_start. Separate from ``_run_countdown``
+        so the latter stays the slow-stragglers branch."""
+        try:
+            await self.transport.broadcast(
+                proto.encode(proto.RoundCountdown(seconds_remaining=0))
+            )
+        except asyncio.CancelledError:
+            return
+        self._round_started = True
+        self._fire_round_start()
+
+    def force_start_round(self) -> None:
+        """Skip the readiness gate entirely (host clicked "Start anyway").
+
+        Cancels any in-flight countdown, broadcasts ``RoundCountdown(0)``
+        so peers receive the start signal, and fires
+        ``on_round_start`` locally. Idempotent — repeated calls after
+        the round has started are no-ops.
+        """
+        if self._round_started:
+            return
+        if self._countdown_task is not None and not self._countdown_task.done():
+            self._countdown_task.cancel()
+        self._countdown_task = asyncio.ensure_future(self._fast_start())
 
     async def _run_countdown(self) -> None:
         """Broadcast RoundCountdown(60), (59), ..., (0), then call

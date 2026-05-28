@@ -120,13 +120,33 @@ def test_double_peer_ready_is_idempotent(event_loop):
 
 
 def test_countdown_broadcasts_and_fires_on_zero(event_loop):
-    """The countdown should broadcast at least the trailing zero and
-    invoke on_round_start exactly once at the end."""
+    """With stragglers — threshold reached at <100% ready — the host
+    runs the full countdown and fires on_round_start at zero."""
+    h = _make_host(["a", "b", "c"])
+    started = []
+    h.on_round_start = lambda: started.append(True)
+    h.COUNTDOWN_SECONDS = 1
+    h.mark_host_ready()
+    # 3 of 4 ready (host + a + b) → 75% threshold, "c" is the straggler.
+    h._apply_peer_ready(proto.PeerReady(player_id="a"))
+    h._apply_peer_ready(proto.PeerReady(player_id="b"))
+    event_loop.run_until_complete(h._countdown_task)
+    seen_seconds = [
+        m.seconds_remaining for m in h.transport.broadcasts
+        if isinstance(m, proto.RoundCountdown)
+    ]
+    # Full countdown should include both the 1 and the trailing 0.
+    assert seen_seconds == [1, 0]
+    assert started == [True]
+
+
+def test_full_readiness_skips_countdown(event_loop):
+    """100%-ready (no stragglers) → no point waiting 60s. Host should
+    broadcast a single RoundCountdown(0) start signal and fire
+    on_round_start immediately."""
     h = _make_host(["peer-1"])
     started = []
     h.on_round_start = lambda: started.append(True)
-    # Shorten the countdown so the test is fast.
-    h.COUNTDOWN_SECONDS = 1
     h.mark_host_ready()
     h._apply_peer_ready(proto.PeerReady(player_id="peer-1"))
     event_loop.run_until_complete(h._countdown_task)
@@ -134,8 +154,46 @@ def test_countdown_broadcasts_and_fires_on_zero(event_loop):
         m.seconds_remaining for m in h.transport.broadcasts
         if isinstance(m, proto.RoundCountdown)
     ]
-    # Should include both the 1 and the trailing 0.
-    assert seen_seconds == [1, 0]
+    assert seen_seconds == [0]
+    assert started == [True]
+
+
+def test_force_start_round_broadcasts_zero_and_fires(event_loop):
+    """``force_start_round`` (host's 'Start anyway' button) cancels
+    whatever the gate was doing and sends RoundCountdown(0) so peers
+    enter play in lockstep with the host."""
+    h = _make_host(["slow-peer"])
+    started = []
+    h.on_round_start = lambda: started.append(True)
+    # Host is ready but the peer never reported — countdown not started.
+    h.mark_host_ready()
+    assert h._countdown_task is None
+    h.force_start_round()
+    event_loop.run_until_complete(h._countdown_task)
+    seen_seconds = [
+        m.seconds_remaining for m in h.transport.broadcasts
+        if isinstance(m, proto.RoundCountdown)
+    ]
+    assert seen_seconds == [0]
+    assert started == [True]
+
+
+def test_force_start_round_cancels_in_progress_countdown(event_loop):
+    """If a slow countdown is already running when the host hits
+    'Start anyway', the in-flight countdown is cancelled and replaced
+    by the fast 0-tick path."""
+    h = _make_host(["a", "b", "c"])
+    started = []
+    h.on_round_start = lambda: started.append(True)
+    h.COUNTDOWN_SECONDS = 5
+    h.mark_host_ready()
+    h._apply_peer_ready(proto.PeerReady(player_id="a"))
+    h._apply_peer_ready(proto.PeerReady(player_id="b"))
+    # Slow countdown is now running.
+    slow = h._countdown_task
+    h.force_start_round()
+    event_loop.run_until_complete(h._countdown_task)
+    assert slow.cancelled() or slow.done()
     assert started == [True]
 
 

@@ -59,6 +59,11 @@ class PrefetchProgressWidget(QWidget):
 
     local_prefetch_done = pyqtSignal()
     ready_to_play = pyqtSignal()
+    # Emitted when the host clicks "Start anyway" — the multiplayer
+    # path needs to broadcast a start signal to peers in addition to
+    # entering play locally, so the connection target differs by mode.
+    # In solo mode the app layer wires this straight to ``ready_to_play``.
+    force_start_requested = pyqtSignal()
     back_requested = pyqtSignal()
 
     def __init__(
@@ -193,10 +198,14 @@ class PrefetchProgressWidget(QWidget):
         # would imply manual control they don't have.
         if not all_empty and not is_peer:
             # "Start anyway" deliberately *bypasses* the multiplayer
-            # start-gate — host explicitly chose to begin regardless of
-            # peer readiness. Fire ``ready_to_play`` directly.
+            # readiness gate — host explicitly chose to begin
+            # regardless of peer readiness. ``force_start_requested``
+            # routes through the MultiplayerHost so peers get a
+            # RoundCountdown(0) start signal in addition to the local
+            # ``ready_to_play``; solo mode wires force_start straight
+            # to ready_to_play.
             self._skip_btn = QPushButton("Start anyway", self)
-            self._skip_btn.clicked.connect(self.ready_to_play.emit)
+            self._skip_btn.clicked.connect(self.force_start_requested.emit)
             btn_row.addWidget(self._skip_btn)
         else:
             self._skip_btn = None
