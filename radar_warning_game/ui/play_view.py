@@ -441,6 +441,7 @@ class PlayView(QWidget):
         # diff can short-circuit the re-render when the visible
         # report set is unchanged (the common case — most ticks
         # don't cross a new report's timestamp).
+        visible: list = []
         if self.session.round_day is not None:
             visible = [
                 r for r in self.session.round_day.reports
@@ -468,7 +469,24 @@ class PlayView(QWidget):
             scores = self.session.current_scores()
         except Exception:  # noqa: BLE001
             scores = []
-        self.leaderboard_window.refresh(scores, self.session.team_names)
+        # Ticker shows ONLY game-area reports — out-of-polygon LSRs
+        # don't contribute to scoring and would just be noise. The
+        # session pre-filters ``cached_reports`` to the game polygon
+        # (with the standard 5 km verification buffer) at begin_play
+        # time; we additionally clip to ``time <= virtual_time`` so
+        # future reports don't leak into the live ticker.
+        in_area_visible = [
+            r for r in self.session.cached_reports
+            if r.time <= tick.virtual_time
+        ]
+        team_warnings: list = []
+        for pid in self._teammate_ids_including_self():
+            team_warnings.extend(self.session.warnings_by_player.get(pid, []))
+        self.leaderboard_window.refresh(
+            scores, self.session.team_names,
+            visible_reports=in_area_visible,
+            team_warnings=team_warnings,
+        )
         # Broadcast the tick to peers (host only)
         if isinstance(self.multiplayer, MultiplayerHost):
             asyncio.ensure_future(self.multiplayer.broadcast_tick(tick))

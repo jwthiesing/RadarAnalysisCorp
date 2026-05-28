@@ -132,6 +132,17 @@ TORNADO_CODES = frozenset({"T"})
 HAIL_CODES = frozenset({"H"})
 WIND_CODES = frozenset({"G", "W", "N", "D"})
 
+# Default wind-speed (mph) for an LSR that lacked a measured magnitude.
+# The IEM "D" code is "thunderstorm wind damage", which is a damage-
+# observed report — no anemometer reading, only that things broke.
+# Such reports come in at MAG=0 (or unset, coerced to 0) which then
+# fails the 58 mph severe-wind threshold, so a real damage-confirmed
+# SVR with four wind reports in its valid window was getting scored
+# as a FA. NWS forecasters routinely treat damage reports as ≥severe
+# by definition (you don't get LSR-worthy damage from sub-severe
+# wind), so we substitute a value just above the severe threshold.
+UNKNOWN_WIND_DEFAULT_MPH = 60.0
+
 _INJ_RE = re.compile(r"(\d+)\s*INJ", re.IGNORECASE)
 _FAT_RE = re.compile(r"(\d+)\s*FAT", re.IGNORECASE)
 
@@ -217,6 +228,10 @@ def _iem_row_to_report(row: pd.Series) -> Report | None:
     mag = float(row.get("MAG", 0.0))
     if cat == "tornado" and mag == 0.0:
         mag = -1.0
+    elif cat == "wind" and mag == 0.0:
+        # Damage-only LSRs (typecode D) often arrive with MAG=0 —
+        # see UNKNOWN_WIND_DEFAULT_MPH for the why.
+        mag = UNKNOWN_WIND_DEFAULT_MPH
     return Report(
         time=row["time"].to_pydatetime(),
         lat=float(row["LAT"]),
