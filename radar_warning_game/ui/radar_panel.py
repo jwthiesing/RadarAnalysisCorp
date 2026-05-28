@@ -835,6 +835,14 @@ class RadarPanel(QFrame):
         # can override per-instance via :meth:`set_vel_range`. Doesn't
         # affect other products' fixed PRODUCTS entries.
         self._vel_vmax: float = float(PRODUCTS["VEL"][3])
+        # CC colormap lower bound. PRODUCTS["CC"]'s static vmin is 0.0,
+        # but ρhv values below ~0.7 in actual storms are pure
+        # nonmeteorological clutter (birds, debris, ground); stretching
+        # the colormap over [0.0, 1.0] wastes half the dynamic range on
+        # values the user never reads quantitatively. The toolbar's CC
+        # vmin spinbox sets this per-grid; we keep an instance field so
+        # the per-panel rasterize path can pick it up.
+        self._cc_vmin: float = 0.5
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
@@ -1132,6 +1140,11 @@ class RadarPanel(QFrame):
                 field = velocity_field
                 if field not in radar.fields and "velocity" in radar.fields:
                     field = "velocity"
+        elif self.product == "CC":
+            # Bump the floor up to the user's CC vmin so ρhv near 0
+            # doesn't waste half the colormap. vmax stays at 1.0 since
+            # the meaningful upper limit doesn't move.
+            vmin = self._cc_vmin
         elev = float(radar.fixed_angle["data"][sweep_no])
         base_title = (f"{site.icao}  {self.product}  {elev:.1f}°   "
                       f"{format_player_time(display_time)}")
@@ -2264,6 +2277,31 @@ class RadarPanelGrid(QWidget):
         )
         self._vel_range_spin.valueChanged.connect(self.set_vel_range)
         h.addWidget(self._vel_range_spin)
+        h.addSpacing(10)
+
+        # CC vmin — lower bound for the ρhv colormap. PRODUCTS["CC"]
+        # nominally maps [0.0, 1.0] but ρhv ≲ 0.7 is just clutter in
+        # most real storms, so stretching the visible band over the
+        # interesting [0.5, 1.0] range gives much more useful contrast
+        # in the debris-signature / non-uniform-beam-filling regions.
+        h.addWidget(QLabel("CC vmin:", bar))
+        self._cc_vmin_spin = QDoubleSpinBox(bar)
+        self._cc_vmin_spin.setRange(0.0, 0.99)
+        self._cc_vmin_spin.setSingleStep(0.05)
+        self._cc_vmin_spin.setDecimals(2)
+        self._cc_vmin_spin.setValue(
+            float(self._panels[0]._cc_vmin) if self._panels else 0.5
+        )
+        self._cc_vmin_spin.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._cc_vmin_spin.setToolTip(
+            "Lower bound for the CC (correlation coefficient / ρhv) "
+            "color scale. The upper bound stays pinned at 1.0. Default "
+            "0.5 hides the nonmeteorological-only band; drop toward 0 "
+            "to see ground clutter / birds, or raise toward 0.9 to "
+            "highlight tornadic-debris signatures."
+        )
+        self._cc_vmin_spin.valueChanged.connect(self.set_cc_vmin)
+        h.addWidget(self._cc_vmin_spin)
         h.addStretch(1)
 
         outer = self.layout()
@@ -2340,6 +2378,18 @@ class RadarPanelGrid(QWidget):
         # the next time the user switches a panel to VEL.
         if self._current_radar is not None and any(
             p.product == "VEL" for p in self._panels
+        ):
+            self._render_all()
+
+    def set_cc_vmin(self, vmin: float) -> None:
+        """Set the CC colormap lower bound on every panel and re-render
+        any CC panels in the current layout. Default 0.5 — see the
+        toolbar tooltip for usage notes."""
+        vmin = float(max(0.0, min(0.99, vmin)))
+        for panel in self._panels:
+            panel._cc_vmin = vmin
+        if self._current_radar is not None and any(
+            p.product == "CC" for p in self._panels
         ):
             self._render_all()
 
