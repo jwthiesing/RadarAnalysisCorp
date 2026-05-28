@@ -65,6 +65,14 @@ class RadarPrefetchState:
     downloaded_scan_times: set[datetime] = field(default_factory=set)
     in_flight: dict[str, Future] = field(default_factory=dict)
     pregame_total: int = 0       # total scans seen by schedule_pregame (cached + new)
+    # Preload (PyART parse + velocity dealias) counters. Bumped from
+    # ``_schedule_preload`` and ``_preload_one`` so the UI can show a
+    # per-radar "preprocessing N/M" bar alongside the download bar.
+    # ``preload_completed`` counts both successes AND failures — a
+    # corrupted file finishing its preload (and being logged) shouldn't
+    # block the round forever.
+    preload_scheduled: int = 0
+    preload_completed: int = 0
 
 
 class Prefetcher:
@@ -218,6 +226,29 @@ class Prefetcher:
 
     def pregame_done(self) -> bool:
         return all(f.done() for state in self._states.values() for f in list(state.in_flight.values()))
+
+    def pregame_preload_progress(self) -> dict[str, tuple[int, int]]:
+        """Per-radar ``(completed, total)`` PyART parse + dealias counts.
+
+        ``total`` mirrors :meth:`pregame_progress`'s ``total`` —
+        ``state.pregame_total`` — because every downloaded volume gets a
+        preload scheduled. ``completed`` is the number that have
+        finished (success OR failure; corrupted files don't block the
+        gate).
+
+        Used by :class:`PrefetchProgressWidget` to render a second
+        per-site bar so the "waiting for clients" gate doesn't release
+        until all clients have not just downloaded but also fully
+        preprocessed every pregame volume.
+        """
+        out: dict[str, tuple[int, int]] = {}
+        with self._lock:
+            for site, state in self._states.items():
+                # Clamp to pregame_total so in-game preloads (advance_clock)
+                # don't push the displayed bar above 100%.
+                completed = min(state.preload_completed, state.pregame_total)
+                out[site] = (completed, state.pregame_total)
+        return out
 
     # ------------------------------ phase 2: in-game -----------------------
 
@@ -389,7 +420,7 @@ class Prefetcher:
                         # PyART parse + dealias haven't run yet — kick
                         # off the preload so the first scrub into this
                         # volume doesn't stall.
-                        self._schedule_preload(local)
+                        self._schedule_preload(state, local)
                         # And ping the UI so the time scrubber's range
                         # extends to cover the newly-indexed sweeps.
                         self._notify_volume_indexed(state.site, local)
@@ -415,7 +446,7 @@ class Prefetcher:
             self._notify_volume_indexed(state.site, local)
             # Chain the preload: parse + dealias in the background so
             # the first render off this volume is instant.
-            self._schedule_preload(local)
+            self._schedule_preload(state, local)
             return local
         except Exception:
             log.exception("Failed to fetch %s", scan.key)
@@ -434,9 +465,14 @@ class Prefetcher:
         except Exception:  # noqa: BLE001
             log.exception("on_volume_indexed callback failed (%s)", local)
 
-    def _schedule_preload(self, file: Path) -> None:
+    def _schedule_preload(self, state: "RadarPrefetchState", file: Path) -> None:
         """Submit a background PyART parse + velocity-dealias for
-        ``file`` (no-op if already loaded or in flight)."""
+        ``file`` (no-op if already loaded or in flight).
+
+        ``state`` is the owning radar's state object — used to bump the
+        per-site preload counters that the UI's "preprocessing" progress
+        bar reads.
+        """
         with self._lock:
             if file in self._loaded_radars or file in self._preload_futures:
                 return
@@ -448,56 +484,66 @@ class Prefetcher:
                 self._preload_pool = ThreadPoolExecutor(
                     max_workers=2, thread_name_prefix="radar-preload",
                 )
-            fut = self._preload_pool.submit(self._preload_one, file)
+            state.preload_scheduled += 1
+            fut = self._preload_pool.submit(self._preload_one, state, file)
             self._preload_futures[file] = fut
 
-    def _preload_one(self, file: Path) -> object | None:
+    def _preload_one(self, state: "RadarPrefetchState", file: Path) -> object | None:
         """Parse + (optionally) dealias one volume. Runs on the preload
         pool. Errors are swallowed and logged so a single bad file
-        doesn't poison the preload queue."""
+        doesn't poison the preload queue.
+
+        Always bumps ``state.preload_completed`` on exit (success OR
+        failure) so the UI progress bar advances past corrupted files
+        and the pre-game "fully preprocessed" check can complete.
+        """
         try:
-            import pyart   # lazy — keeps import-time cheap for tests
-            radar = pyart.io.read_nexrad_archive(str(file))
-        except Exception as e:  # noqa: BLE001
-            log.warning("Preload failed for %s: %s", file, e)
-            with self._lock:
-                self._preload_futures.pop(file, None)
-            return None
-        # PyART's NEXRAD reader leaves Nyquist-velocity zeroed on TDWR
-        # (and some legacy WSR-88D) files; the dealias algorithms then
-        # divide-by-zero. Repair the metadata before handing the radar
-        # to dealias — otherwise the call below throws every time and
-        # we ship out a radar without a corrected_velocity field, which
-        # forces the grid to fall back to raw aliased velocity on
-        # display.
-        from .radar_repair import ensure_nyquist_velocity
-        ensure_nyquist_velocity(radar)
-        with self._lock:
-            mode = self._preload_dealias_mode
-        if mode and "velocity" in radar.fields:
             try:
-                if mode == "region_based":
-                    corrected = pyart.correct.dealias_region_based(radar)
-                elif mode == "phase_unwrap":
-                    corrected = pyart.correct.dealias_unwrap_phase(radar)
-                else:
-                    corrected = None
-                if corrected is not None:
-                    radar.add_field(
-                        "corrected_velocity", corrected, replace_existing=True,
-                    )
+                import pyart   # lazy — keeps import-time cheap for tests
+                radar = pyart.io.read_nexrad_archive(str(file))
             except Exception as e:  # noqa: BLE001
-                log.warning("Preload dealias (%s) failed for %s: %s",
-                            mode, file, e)
-        with self._lock:
-            self._loaded_radars[file] = radar
-            while len(self._loaded_radars) > PRELOAD_CACHE_MAX:
-                self._loaded_radars.popitem(last=False)
-            self._preload_futures.pop(file, None)
-            cb = self._on_radar_preloaded
-        if cb is not None:
-            try:
-                cb(file, radar)
-            except Exception:  # noqa: BLE001
-                log.exception("on_radar_preloaded callback failed")
-        return radar
+                log.warning("Preload failed for %s: %s", file, e)
+                with self._lock:
+                    self._preload_futures.pop(file, None)
+                return None
+            # PyART's NEXRAD reader leaves Nyquist-velocity zeroed on
+            # TDWR (and some legacy WSR-88D) files; the dealias
+            # algorithms then divide-by-zero. Repair the metadata
+            # before handing the radar to dealias — otherwise the call
+            # below throws every time and we ship out a radar without
+            # a corrected_velocity field, which forces the grid to
+            # fall back to raw aliased velocity on display.
+            from .radar_repair import ensure_nyquist_velocity
+            ensure_nyquist_velocity(radar)
+            with self._lock:
+                mode = self._preload_dealias_mode
+            if mode and "velocity" in radar.fields:
+                try:
+                    if mode == "region_based":
+                        corrected = pyart.correct.dealias_region_based(radar)
+                    elif mode == "phase_unwrap":
+                        corrected = pyart.correct.dealias_unwrap_phase(radar)
+                    else:
+                        corrected = None
+                    if corrected is not None:
+                        radar.add_field(
+                            "corrected_velocity", corrected, replace_existing=True,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Preload dealias (%s) failed for %s: %s",
+                                mode, file, e)
+            with self._lock:
+                self._loaded_radars[file] = radar
+                while len(self._loaded_radars) > PRELOAD_CACHE_MAX:
+                    self._loaded_radars.popitem(last=False)
+                self._preload_futures.pop(file, None)
+                cb = self._on_radar_preloaded
+            if cb is not None:
+                try:
+                    cb(file, radar)
+                except Exception:  # noqa: BLE001
+                    log.exception("on_radar_preloaded callback failed")
+            return radar
+        finally:
+            with self._lock:
+                state.preload_completed += 1

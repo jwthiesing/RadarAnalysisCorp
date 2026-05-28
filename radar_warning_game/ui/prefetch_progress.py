@@ -158,26 +158,38 @@ class PrefetchProgressWidget(QWidget):
             warn.setWordWrap(True)
             layout.addWidget(warn)
 
+        # Per-site preprocessing (PyART parse + velocity dealias) bars.
+        # Same gating logic as the download bars: empty sites get the
+        # muted-red "no data" treatment and don't gate the round.
+        self._preload_bars: dict[str, QProgressBar] = {}
         for site in prefetcher.sites:
             row = QLabel(site, self)
             row.setAlignment(Qt.AlignmentFlag.AlignCenter)
             bar = QProgressBar(self)
             bar.setRange(0, 100)
             bar.setValue(0)
+            preload_bar = QProgressBar(self)
+            preload_bar.setRange(0, 100)
+            preload_bar.setValue(0)
+            preload_bar.setFormat("preprocess: 0/0")
             if site in self._empty_sites:
-                # Permanently empty — render the bar in muted red and
-                # set its text to the diagnosis so it's not confused
+                # Permanently empty — render both bars in muted red and
+                # set their text to the diagnosis so it's not confused
                 # with the "(listing…)" startup state.
-                bar.setRange(0, 1)
-                bar.setValue(0)
+                for b in (bar, preload_bar):
+                    b.setRange(0, 1)
+                    b.setValue(0)
+                    b.setStyleSheet(
+                        "QProgressBar { background-color: #3a1a1a; color: #ff8a8a; "
+                        "border: 1px solid #5a2a2a; text-align: center; }"
+                    )
                 bar.setFormat(f"{site}: no archive data for this day")
-                bar.setStyleSheet(
-                    "QProgressBar { background-color: #3a1a1a; color: #ff8a8a; "
-                    "border: 1px solid #5a2a2a; text-align: center; }"
-                )
+                preload_bar.setFormat("preprocess: —")
             layout.addWidget(row)
             layout.addWidget(bar)
+            layout.addWidget(preload_bar)
             self._bars[site] = bar
+            self._preload_bars[site] = preload_bar
 
         # Buttons row — always show "back to radar selection" so there's
         # an escape even when the prefetcher is happily downloading
@@ -222,22 +234,39 @@ class PrefetchProgressWidget(QWidget):
 
     def _poll(self) -> None:
         progress = self.prefetcher.pregame_progress()
-        # Gate auto-advance on whether *non-empty* sites have finished.
+        preload_progress = self.prefetcher.pregame_preload_progress()
+        # Gate auto-advance on whether *non-empty* sites have finished
+        # BOTH the download AND the PyART parse + velocity dealias.
         # Empty sites stay at 0/0 forever and would otherwise block
-        # ``ready_to_play`` from ever firing.
+        # ``local_prefetch_done`` from ever firing. The user-visible
+        # "ready" state needs both phases done so the round doesn't
+        # start with the host idle and peers still chewing through
+        # dealias on a slow CPU.
         all_done = True
         any_seen = False
         for site, bar in self._bars.items():
-            done, total = progress.get(site, (0, 0))
             if site in self._empty_sites:
-                # Already marked at construction; nothing to update.
                 continue
+            done, total = progress.get(site, (0, 0))
+            pl_done, pl_total = preload_progress.get(site, (0, 0))
             if total > 0:
                 any_seen = True
                 bar.setRange(0, total)
                 bar.setValue(done)
-                bar.setFormat(f"{done}/{total}")
+                bar.setFormat(f"download: {done}/{total}")
                 if done < total:
+                    all_done = False
+                pl_bar = self._preload_bars[site]
+                # preload_total tracks pregame_total once schedule_pregame
+                # finishes listing; until the first download completes,
+                # it's 0. Show as the same denominator as downloads so
+                # the user sees a clear 0/N progression rather than
+                # 0/0 → 1/1 → 2/2 jitter.
+                pl_denom = total
+                pl_bar.setRange(0, max(pl_denom, 1))
+                pl_bar.setValue(pl_done)
+                pl_bar.setFormat(f"preprocess: {pl_done}/{pl_denom}")
+                if pl_done < pl_denom:
                     all_done = False
             else:
                 bar.setRange(0, 1)
