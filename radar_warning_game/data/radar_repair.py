@@ -16,18 +16,19 @@ Two failure modes covered:
    their PRF mid-sweep to extend the unambiguous range, which leaves
    different rays in the same sweep with different Nyquist values
    ("Nyquist velocities are not uniform in sweep"). PyART's region-based
-   dealias rejects the sweep outright in that case. The per-ray values
-   on disk are the unambiguous limit of each individual PRF pulse —
-   *not* the effective Nyquist of the combined post-stagger return,
-   which is set by the radar's slowest PRF and could be much higher.
-   So we derive the per-sweep Nyquist from the observed velocity field
-   the same way the bad-data path does — ``max(|v|)`` is by construction
-   an upper bound on |v| and avoids both under-reporting (which would
-   cause valid velocities to get unfolded incorrectly) and using the
-   file's mixed-PRF values that don't represent the real ceiling.
+   dealias rejects the sweep outright in that case. We use the
+   **lowest non-zero Nyquist** the file states for that sweep — a
+   conservative choice that matches the slowest PRF actually recorded.
+   Older WSR-88D archives sometimes contain pre-dealiased velocities,
+   so deriving a Nyquist from ``max(|v|)`` would overshoot (the
+   dealiased values can be much larger than the original unambiguous
+   limit). Falling back to the file's lowest stated value avoids that
+   mistake. If every per-ray value in the sweep is zero (a degenerate
+   metadata case), we drop to the bad-data path's velocity-derived
+   estimate.
 
 In both cases the repair makes the per-sweep arrays uniform so PyART
-will run; the value used is always a safe upper bound on |v|.
+will run.
 """
 
 from __future__ import annotations
@@ -58,16 +59,15 @@ def ensure_nyquist_velocity(radar) -> bool:
     per-ray array that PyART's dealias algorithms accept. Returns
     ``True`` if a repair was performed.
 
-    Two repair triggers — **both resolved identically** by deriving
-    each sweep's Nyquist from the observed ``velocity`` field:
+    Two repair triggers:
       - **Missing / empty / non-finite / all-zero data** → no source
         values to start from; ``max(|v|) × safety_margin`` is the
         only signal available.
-      - **Non-uniform within a sweep** (PRF stagger) → the per-ray
-        values are individual-PRF unambiguous limits, not the
-        effective post-stagger Nyquist. Deriving from
-        ``max(|v|) × safety_margin`` gives the correct ceiling (|v|
-        is by construction bounded by the *real* Nyquist).
+      - **Non-uniform within a sweep** (PRF stagger) → use the lowest
+        non-zero Nyquist the file states for that sweep. That's a
+        conservative choice that matches the slowest PRF recorded
+        and won't overshoot like ``max(|v|)`` does on already-
+        dealiased older archives.
     """
     if "velocity" not in radar.fields:
         return False
@@ -76,9 +76,12 @@ def ensure_nyquist_velocity(radar) -> bool:
     existing = radar.instrument_parameters.get("nyquist_velocity")
     existing_data = existing["data"] if existing is not None else None
 
-    # Decide which repair path applies.
+    # Decide which repair path applies, and for the non-uniform case
+    # remember the source per-ray array so the per-sweep loop below
+    # can read the file's stated Nyquist values directly.
     bad_data = False
     nonuniform = False
+    source_arr: np.ndarray | None = None
     if existing_data is None:
         bad_data = True
     else:
@@ -90,13 +93,19 @@ def ensure_nyquist_velocity(radar) -> bool:
         elif np.allclose(arr, 0.0):
             bad_data = True
         elif arr.size == radar.nrays:
-            # Check uniformity sweep-by-sweep. We only repair when
-            # there's actually a mismatch; uniform-good arrays are
-            # left untouched.
+            # Check uniformity sweep-by-sweep against the **magnitude**
+            # of each ray's stated Nyquist. Sign is meaningless for an
+            # unambiguous-velocity bound — a ``-25`` value just means
+            # the file encoded the limit in the negative direction.
+            # Without ``abs`` here a sweep like ``[+25, -25]`` would
+            # look wildly non-uniform when it's effectively the same
+            # PRF limit twice. We only repair when there's actually a
+            # mismatch; uniform-good arrays are left untouched.
+            arr_abs = np.abs(arr)
             for sw in range(radar.nsweeps):
                 s = int(radar.sweep_start_ray_index["data"][sw])
                 e = int(radar.sweep_end_ray_index["data"][sw]) + 1
-                sweep_ny = arr[s:e]
+                sweep_ny = arr_abs[s:e]
                 if sweep_ny.size == 0:
                     continue
                 spread = float(sweep_ny.max() - sweep_ny.min())
@@ -104,6 +113,8 @@ def ensure_nyquist_velocity(radar) -> bool:
                 if spread / ref > _NYQUIST_UNIFORM_TOL:
                     nonuniform = True
                     break
+            if nonuniform:
+                source_arr = arr_abs
     if not (bad_data or nonuniform):
         return False
 
@@ -112,11 +123,32 @@ def ensure_nyquist_velocity(radar) -> bool:
     for sw in range(radar.nsweeps):
         s = int(radar.sweep_start_ray_index["data"][sw])
         e = int(radar.sweep_end_ray_index["data"][sw]) + 1
-        # Single derivation strategy: take the sweep's observed
-        # ``max(|v|)`` and pad by the safety margin. This is correct
-        # for both repair triggers — see the module docstring for why
-        # we don't trust the file's mixed-PRF values for the
-        # non-uniform case either.
+        # Non-uniform path: trust the file's stated per-ray values
+        # and pick the *lowest non-zero* Nyquist for this sweep.
+        # That matches the slowest PRF the radar actually recorded
+        # and avoids the ``max(|v|)`` mistake on archives that
+        # already had their velocities dealiased (the inflated
+        # observed |v| would push the Nyquist way above the true
+        # unambiguous limit, defeating the dealias retry). A sweep
+        # whose stated values are all zero falls through to the
+        # velocity-derived path below.
+        if source_arr is not None:
+            # ``source_arr`` is the magnitude of the file's stated
+            # Nyquist values (see the abs() applied where it's
+            # captured). Filtering ``> 0`` drops bad-metadata rays
+            # without depending on the original sign — a file that
+            # encoded the limit as -25 still contributes 25 here, and
+            # a sweep with all-negative Nyquists no longer silently
+            # falls through to the velocity-derived path.
+            sweep_stated = source_arr[s:e]
+            nonzero = sweep_stated[sweep_stated > 0.0]
+            if nonzero.size > 0:
+                per_ray_nyquist[s:e] = float(nonzero.min())
+                continue
+        # Bad-data path (or non-uniform sweep with no non-zero values
+        # to fall back on): take the sweep's observed ``max(|v|)``
+        # and pad by the safety margin. ``max(|v|)`` is the only
+        # signal we have when the file gave us nothing.
         sweep_v = velocity[s:e]
         if hasattr(sweep_v, "compressed"):
             samples = sweep_v.compressed()
@@ -146,11 +178,9 @@ def ensure_nyquist_velocity(radar) -> bool:
         "long_name": "unambiguous_doppler_velocity",
         "comments": (
             "Repaired by radar_repair.ensure_nyquist_velocity "
-            f"({', '.join(reason)}). Each sweep's Nyquist is derived "
-            "from the observed |velocity| max plus a small safety "
-            "margin — correct for both missing/zero values and "
-            "PRF-staggered values that don't represent the effective "
-            "post-stagger Nyquist."
+            f"({', '.join(reason)}). Non-uniform sweeps use the lowest "
+            "non-zero per-ray Nyquist the file stated; bad/empty/zero "
+            "sweeps fall back to observed |velocity| max × safety margin."
         ),
     }
     log.debug(

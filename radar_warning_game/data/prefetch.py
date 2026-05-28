@@ -523,6 +523,9 @@ class Prefetcher:
                         corrected = pyart.correct.dealias_region_based(radar)
                     elif mode == "phase_unwrap":
                         corrected = pyart.correct.dealias_unwrap_phase(radar)
+                    elif mode == "ray_by_ray":
+                        from .dealias_ray import dealias_ray_by_ray
+                        corrected = dealias_ray_by_ray(radar)
                     else:
                         corrected = None
                     if corrected is not None:

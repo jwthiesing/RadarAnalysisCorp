@@ -302,21 +302,15 @@ def _classify_outcome(
     Single-hazard warnings (a pure TOR, or an SVR tagged with just hail
     or just wind) can only be ``'verified'`` or ``'false_alarm'`` — there
     is no partial state for them, by construction.
+
+    The "claimed hazards" set is computed by
+    :func:`verification.scoring.claimed_hazards` so the recap stays in
+    lockstep with the live FA/POD/FAR scoring engine.
     """
+    from ..verification.scoring import claimed_hazards
     rev = w.current_revision
     wt = rev.warning_type
-    mag = rev.magnitudes
-
-    claimed: set[str] = set()
-    if wt.is_tornado_family:
-        claimed.add("tornado")
-    elif wt.is_severe_family:
-        if mag.hail_in is not None and mag.hail_in > 0:
-            claimed.add("hail")
-        if mag.wind_mph is not None and mag.wind_mph > 0:
-            claimed.add("wind")
-        if getattr(mag, "tornado_possible", False):
-            claimed.add("tornado")
+    claimed = claimed_hazards(w)
 
     if not claimed:
         # Bare warning with no tags — partial doesn't apply, fall back to

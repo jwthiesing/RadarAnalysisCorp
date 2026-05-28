@@ -148,6 +148,37 @@ def _sum_casualties(matches: list[VerifyingMatch]) -> int:
     return sum(m.report.injuries + m.report.fatalities for m in matches)
 
 
+def claimed_hazards(warning: Warning) -> set[str]:
+    """Hazard categories the warning's current revision actually
+    *claims* — i.e. those the issuer explicitly tagged.
+
+    For an SVR-family warning, that's any of ``{hail, wind, tornado}``
+    based on which magnitude fields are set (hail_in > 0, wind_mph > 0,
+    or the tornado_possible flag). For a TOR-family warning it's just
+    ``{tornado}``. A bare warning with no tags returns the empty set,
+    which the FA logic treats as "any verifying report counts" — same
+    as before the partial-verification refactor.
+
+    Used by FA / partial / verified classification (in both
+    ``score_single_warning`` and the recap map) to ensure a wind-only
+    report against a hail-only-predicted SVR doesn't accidentally
+    rescue the warning from FA — the user predicted hail, so hail is
+    what must materialize.
+    """
+    rev = warning.current_revision
+    if rev.warning_type.is_tornado_family:
+        return {"tornado"}
+    mag = rev.magnitudes
+    out: set[str] = set()
+    if mag.hail_in is not None and mag.hail_in > 0:
+        out.add("hail")
+    if mag.wind_mph is not None and mag.wind_mph > 0:
+        out.add("wind")
+    if getattr(mag, "tornado_possible", False):
+        out.add("tornado")
+    return out
+
+
 def _reports_in_warning(
     warning: Warning,
     reports: list[Report],
@@ -337,9 +368,27 @@ def score_single_warning(warning: Warning, reports: list[Report]) -> WarningScor
     FA penalties use the current revision's tier (it's the player's final claim).
     """
     matches = find_verifying_reports(warning, reports)
-    is_fa = len(matches) == 0
     current_type = warning.current_revision.warning_type
     cur_mag = warning.current_revision.magnitudes
+
+    # FA / partial / verified decision is based on **covered claimed
+    # hazards**: only reports of categories the warning explicitly
+    # tagged count for verification. A wind report against a
+    # hail-only-predicted SVR doesn't rescue the warning from FA;
+    # conversely, a severe hail report on a hail+wind SVRD verifies
+    # the hail leg even if no severe wind materializes (the wind
+    # gets a 0 magnitude-accuracy hit but the warning is NOT a FA).
+    # Tier / magnitude-accuracy bonuses are separate components so
+    # an SVRD with severe-but-sub-SVRD-tier hail (e.g. 1.5") still
+    # scores positively — just without the SVRD tier multiplier.
+    claimed = claimed_hazards(warning)
+    if claimed:
+        relevant_matches = [m for m in matches if m.report.category in claimed]
+        is_fa = len(relevant_matches) == 0
+    else:
+        # Bare warning with no tags — preserve historical behavior
+        # (any verifying report saves it from FA).
+        is_fa = len(matches) == 0
 
     mag_acc = _magnitude_accuracy(warning, matches, reports)
     mag_bonus = mag_acc * MAG_ACCURACY_WEIGHT
@@ -376,9 +425,17 @@ def score_single_warning(warning: Warning, reports: list[Report]) -> WarningScor
 
     # Verified: per-match per-revision tier. Base points depend on the warning's
     # current family (which dictates BASE_TOR_POINTS vs BASE_SVR_POINTS).
+    # When claimed hazards are set, only count claimed-category matches
+    # toward the tier mean — otherwise an unpredicted hazard could
+    # bend the multiplier away from what the player actually
+    # forecast.
+    scoring_matches = (
+        [m for m in matches if m.report.category in claimed]
+        if claimed else matches
+    )
     base_pts = BASE_TOR_POINTS if current_type.is_tornado_family else BASE_SVR_POINTS
     per_match_mults = [
-        _tier_multiplier_for_match(m.revision.warning_type, m) for m in matches
+        _tier_multiplier_for_match(m.revision.warning_type, m) for m in scoring_matches
     ]
     if per_match_mults:
         mean_tier = sum(per_match_mults) / len(per_match_mults)

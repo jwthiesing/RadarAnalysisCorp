@@ -112,6 +112,11 @@ class DealiasMode(str, Enum):
     NONE = "none"
     REGION_BASED = "region_based"
     PHASE_UNWRAP = "phase_unwrap"
+    # Custom in-house dealiaser. Goes ray-by-ray using each ray's
+    # own Nyquist value, so it handles PRF-staggered sweeps that
+    # PyART's REGION_BASED / PHASE_UNWRAP both refuse. Also typically
+    # the fastest of the three on a modern CPU.
+    RAY_BY_RAY = "ray_by_ray"
 
 
 # Product → (PyART field name, colormap name, vmin, vmax) in m/s for velocity.
@@ -2244,6 +2249,7 @@ class RadarPanelGrid(QWidget):
         self._dealias_combo = QComboBox(bar)
         self._dealias_combo.addItem("Region-based", DealiasMode.REGION_BASED)
         self._dealias_combo.addItem("Phase unwrap", DealiasMode.PHASE_UNWRAP)
+        self._dealias_combo.addItem("Ray-by-ray (PRF-stagger safe)", DealiasMode.RAY_BY_RAY)
         self._dealias_combo.addItem("None (raw)", DealiasMode.NONE)
         idx = self._dealias_combo.findData(self._dealias_mode)
         if idx >= 0:
@@ -2252,7 +2258,11 @@ class RadarPanelGrid(QWidget):
         self._dealias_combo.setToolTip(
             "How to undo velocity aliasing (folding) before display.\n"
             "Region-based: PyART's region-growing dealiasing (default).\n"
-            "Phase unwrap: works better for strong shear / fast storms.\n"
+            "Phase unwrap: PyART's 2D phase unwrap — good on strong shear.\n"
+            "Ray-by-ray: in-house 1D unwrap with clutter-spike masking\n"
+            "  + per-ray Nyquist derivation for disuniform sweeps;\n"
+            "  handles old PRF-staggered archives where the PyART\n"
+            "  dealiasers refuse to run. ~180 ms per WSR-88D volume.\n"
             "None: shows raw Doppler velocity (will fold past ±Nyquist)."
         )
         self._dealias_combo.currentIndexChanged.connect(
@@ -2484,6 +2494,9 @@ class RadarPanelGrid(QWidget):
                 corrected = pyart.correct.dealias_region_based(radar)
             elif self._dealias_mode == DealiasMode.PHASE_UNWRAP:
                 corrected = pyart.correct.dealias_unwrap_phase(radar)
+            elif self._dealias_mode == DealiasMode.RAY_BY_RAY:
+                from ..data.dealias_ray import dealias_ray_by_ray
+                corrected = dealias_ray_by_ray(radar)
             else:
                 return
             radar.add_field(CORRECTED_VELOCITY_FIELD, corrected, replace_existing=True)

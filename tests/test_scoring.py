@@ -197,6 +197,26 @@ def test_hail_predicted_zero_no_hail_observed_gets_full_credit():
     assert ws.magnitude_bonus == pytest.approx(0.5)
 
 
+def test_svr_only_predicted_hazard_counts_for_fa():
+    """An SVR predicting only hail should NOT be rescued from FA by a
+    severe wind report — the player staked a claim on hail, not wind.
+    Conversely, the same SVR getting only sub-SVRD-tier severe hail
+    should be partial verification (positive score), not FA — severe
+    hail is still hail, just below the player's bonus aspiration.
+    """
+    # Predicted hail only; wind verifies SVR-family but isn't a claimed hazard.
+    w_hail = _w(wt=WarningType.SVR, mag=Magnitudes(hail_in=1.5))
+    wind_only_report = _r(category="wind", magnitude=70)
+    ws = score_single_warning(w_hail, [wind_only_report])
+    assert ws.is_false_alarm is True, "unpredicted wind shouldn't save SVR(hail) from FA"
+    # Predicted hail+wind, only severe hail materializes → partial verification.
+    w_both = _w(wt=WarningType.SVRD, mag=Magnitudes(hail_in=3.0, wind_mph=85))
+    severe_but_sub_svrd_hail = _r(category="hail", magnitude=1.5)
+    ws = score_single_warning(w_both, [severe_but_sub_svrd_hail])
+    assert ws.is_false_alarm is False, "1.5\" hail must at least partially verify SVRD"
+    assert ws.points > 0, "partial verification must score positively"
+
+
 def test_canceled_warning_still_scores_during_active_period():
     """A canceled warning isn't excluded from scoring — reports that
     occurred between issue and cancel still verify it, earning normal
