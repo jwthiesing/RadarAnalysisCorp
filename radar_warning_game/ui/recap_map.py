@@ -29,7 +29,13 @@ from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
 from ..data.reports import Report
 from ..data.sites import site_by_icao
 from ..game.session import GameSession
-from ..verification.reports_in_poly import Warning, find_verifying_reports
+from ..geo.polygons import contains_with_buffer
+from ..verification.reports_in_poly import (
+    DEFAULT_VERIFICATION_BUFFER_KM,
+    VerifyingMatch,
+    Warning,
+    find_verifying_reports,
+)
 from ..verification.tornado_tiers import WarningType
 from .overlay_loader import load_conus_lines_latlon
 from .radar_panel import _concat_with_gaps
@@ -40,6 +46,7 @@ log = logging.getLogger(__name__)
 # Outcome palette — distinguishable for the dichromacy-common red/green
 # axis by leaning red toward orange-red and green toward cyan-green.
 _VERIFIED_COLOR = "#33dd88"
+_PARTIAL_COLOR = "#ffcc33"
 _FALSE_ALARM_COLOR = "#ee5544"
 _CANCELED_DIM = "#888888"
 
@@ -95,14 +102,14 @@ class RecapMap(QWidget):
         self._draw_basemap()
         self._draw_game_polygon()
         self._draw_radar_sites()
-        n_verified, n_fa = self._draw_warnings()
+        n_verified, n_partial, n_fa = self._draw_warnings()
         n_reports = self._draw_reports()
-        self._set_caption(n_verified, n_fa, n_reports)
+        self._set_caption(n_verified, n_partial, n_fa, n_reports)
 
     # ------------------------------------------------------------------
 
-    def _set_caption(self, verified: int, fa: int, reports: int) -> None:
-        total_w = verified + fa
+    def _set_caption(self, verified: int, partial: int, fa: int, reports: int) -> None:
+        total_w = verified + partial + fa
         if total_w == 0:
             self._caption.setText(
                 "<b>Your warnings</b> &nbsp; "
@@ -112,6 +119,7 @@ class RecapMap(QWidget):
         self._caption.setText(
             "<b>Your warnings</b> &nbsp; "
             f"<span style='color:{_VERIFIED_COLOR}'>● verified {verified}</span> &nbsp; "
+            f"<span style='color:{_PARTIAL_COLOR}'>● partial {partial}</span> &nbsp; "
             f"<span style='color:{_FALSE_ALARM_COLOR}'>● false alarm {fa}</span> &nbsp; "
             f"<span style='color:#aaa'>{reports} reports in game area</span>"
         )
@@ -180,32 +188,37 @@ class RecapMap(QWidget):
             label.setZValue(10)
             self.view.addItem(label, ignoreBounds=True)
 
-    def _draw_warnings(self) -> tuple[int, int]:
+    def _draw_warnings(self) -> tuple[int, int, int]:
         warnings = self.session.warnings_by_player.get(self.local_player_id, [])
         reports = self._round_reports()
-        n_verified = 0
-        n_fa = 0
+        n_verified = n_partial = n_fa = 0
         for w in warnings:
             verifying = find_verifying_reports(w, reports)
-            is_verified = len(verifying) > 0
-            if is_verified:
+            outcome = _classify_outcome(w, verifying, reports)
+            if outcome == "verified":
                 n_verified += 1
+            elif outcome == "partial":
+                n_partial += 1
             else:
                 n_fa += 1
-            self._draw_single_warning(w, is_verified)
-        return n_verified, n_fa
+            self._draw_single_warning(w, outcome)
+        return n_verified, n_partial, n_fa
 
-    def _draw_single_warning(self, w: Warning, verified: bool) -> None:
+    def _draw_single_warning(self, w: Warning, outcome: str) -> None:
         rev = w.current_revision
         verts = list(rev.polygon.vertices) + [rev.polygon.vertices[0]]
         lons = np.array([v[1] for v in verts], dtype=np.float64)
         lats = np.array([v[0] for v in verts], dtype=np.float64)
         lw = _TIER_LW.get(rev.warning_type, 1.8)
-        color = _VERIFIED_COLOR if verified else _FALSE_ALARM_COLOR
+        color = {
+            "verified":    _VERIFIED_COLOR,
+            "partial":     _PARTIAL_COLOR,
+            "false_alarm": _FALSE_ALARM_COLOR,
+        }[outcome]
         # Cancelled warnings get a dashed outline so you can still see
         # which ones you pulled back vs. let ride to expiration. They
-        # still carry the verified/FA color since they still count for
-        # any reports during their active period.
+        # still carry the outcome color since they still count for any
+        # reports during their active period.
         style = (Qt.PenStyle.DashLine if w.canceled_at is not None
                  else Qt.PenStyle.SolidLine)
         pen = pg.mkPen(color=color, width=lw, style=style)
@@ -271,6 +284,73 @@ class RecapMap(QWidget):
                 continue
             out.append(r)
         return out
+
+
+def _classify_outcome(
+    w: Warning,
+    verifying: list[VerifyingMatch],
+    round_reports: list[Report],
+) -> str:
+    """Return ``'verified'`` / ``'partial'`` / ``'false_alarm'``.
+
+    "Partial" only applies to warnings that staked claims on **multiple**
+    hazards (typical SVR: hail-size *and* wind-gust tags; or any SVR that
+    also carries the IBW "tornado possible" tag). If some but not all of
+    the tagged hazards saw verifying reports during the active window,
+    the warning is partial.
+
+    Single-hazard warnings (a pure TOR, or an SVR tagged with just hail
+    or just wind) can only be ``'verified'`` or ``'false_alarm'`` — there
+    is no partial state for them, by construction.
+    """
+    rev = w.current_revision
+    wt = rev.warning_type
+    mag = rev.magnitudes
+
+    claimed: set[str] = set()
+    if wt.is_tornado_family:
+        claimed.add("tornado")
+    elif wt.is_severe_family:
+        if mag.hail_in is not None and mag.hail_in > 0:
+            claimed.add("hail")
+        if mag.wind_mph is not None and mag.wind_mph > 0:
+            claimed.add("wind")
+        if getattr(mag, "tornado_possible", False):
+            claimed.add("tornado")
+
+    if not claimed:
+        # Bare warning with no tags — partial doesn't apply, fall back to
+        # the basic any-report-verifies rule.
+        return "verified" if verifying else "false_alarm"
+
+    verified: set[str] = {m.report.category for m in verifying
+                          if m.report.category in claimed}
+
+    # "Tornado possible" on an SVR doesn't trigger `find_verifying_reports`
+    # for tornados (the SVR type filters those out), so check separately:
+    # any tornado report in the warning's polygon during its valid window
+    # counts as the tornado claim verifying.
+    if "tornado" in claimed and "tornado" not in verified and wt.is_severe_family:
+        issue = w.original_issue_time
+        end = w.end_time()
+        for r in round_reports:
+            if r.category != "tornado":
+                continue
+            if not (issue <= r.time <= end):
+                continue
+            rev_at = w.revision_at(r.time) or w.revisions[0]
+            if contains_with_buffer(
+                rev_at.polygon, r.lat, r.lon,
+                buffer_km=DEFAULT_VERIFICATION_BUFFER_KM,
+            ):
+                verified.add("tornado")
+                break
+
+    if not verified:
+        return "false_alarm"
+    if verified == claimed:
+        return "verified"
+    return "partial"
 
 
 def _report_size(category: str, magnitude: float) -> float:
