@@ -109,6 +109,15 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("RadarAnalysisCorp")
         self.resize(1500, 950)
+        # Placeholder local id used only until the mode dialog picks a
+        # branch. Solo keeps "local"; host MP swaps it for the
+        # signaling-server-assigned ``host_id``; peer MP swaps it for
+        # the assigned ``peer_id``. Using the signaling id is what
+        # makes warnings issued by different clients land under
+        # *different* keys in everyone's session — without that, every
+        # client's warnings ended up keyed under the literal string
+        # ``"local"`` on every other client, so the team-visibility
+        # filter trivially included them all.
         self.local_player_id = "local"
         self.local_player_name = local_player_name
 
@@ -118,10 +127,10 @@ class MainWindow(QMainWindow):
         bar = QStatusBar(self)
         self.setStatusBar(bar)
 
+        # Session built empty here — the local player is added later
+        # by ``_set_local_player_id`` once the mode is known and we have
+        # a stable id to register under.
         self.session = GameSession()
-        self.session.add_player(
-            Player(player_id=self.local_player_id, display_name=local_player_name, is_host=True)
-        )
         self._cache = HashedCache(DEFAULT_CACHE_ROOT / "radar", suffix=".ar2v")
 
         # Holders set as we progress
@@ -146,6 +155,36 @@ class MainWindow(QMainWindow):
     # mode selection
     # ----------------------------------------------------------------------
 
+    def _set_local_player_id(self, new_id: str) -> None:
+        """Register the local player under ``new_id`` in the session.
+
+        Idempotent: re-keys an existing player in ``session.players``
+        and their solo team if we're updating from the placeholder
+        ``"local"`` to a signaling-server id. Called once per session
+        per mode (solo on entry, host MP after ``HostTransport.start``,
+        peer MP after ``ClientTransport.join``).
+        """
+        old_id = self.local_player_id
+        if new_id == old_id and old_id in self.session.players:
+            return
+        # Pull the old player (if any) so we can preserve display name.
+        old_player = self.session.players.pop(old_id, None)
+        # Tear down the placeholder's solo team too.
+        for tid in list(self.session.teams.keys()):
+            if old_id in self.session.teams[tid]:
+                self.session.teams[tid] = [
+                    p for p in self.session.teams[tid] if p != old_id
+                ]
+                if not self.session.teams[tid]:
+                    del self.session.teams[tid]
+                    self.session.team_names.pop(tid, None)
+        self.local_player_id = new_id
+        display = old_player.display_name if old_player else self.local_player_name
+        is_host = old_player.is_host if old_player else False
+        self.session.add_player(
+            Player(player_id=new_id, display_name=display, is_host=is_host)
+        )
+
     def _show_mode_dialog(self) -> None:
         dlg = ModeDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -153,7 +192,15 @@ class MainWindow(QMainWindow):
             return
         self._mode = dlg.mode()
         self.local_player_name = dlg.display_name()
-        self.session.players[self.local_player_id].display_name = self.local_player_name
+        # Register the local player. Solo / pre-MP paths use the
+        # placeholder id "local" — MP paths will re-key once the
+        # signaling server assigns a real one.
+        is_host = self._mode == ModeDialog.HOST
+        self.session.add_player(Player(
+            player_id=self.local_player_id,
+            display_name=self.local_player_name,
+            is_host=is_host,
+        ))
         self._signaling_url = dlg.signaling_url()
         if self._mode == ModeDialog.SOLO:
             self._show_day_picker()
@@ -206,8 +253,16 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Host failed", f"Could not host room: {e}")
             self.close()
             return
+        # Re-key the local player under the signaling-assigned host_id
+        # so warnings issued here land in a globally-unique bucket
+        # rather than under the placeholder "local".
+        if self._host_transport.host_id:
+            self._set_local_player_id(self._host_transport.host_id)
         # Build the multiplayer wrapper now (so it can register peer callbacks)
-        self._multiplayer = MultiplayerHost(self.session, self._host_transport)
+        self._multiplayer = MultiplayerHost(
+            self.session, self._host_transport,
+            host_player_id=self.local_player_id,
+        )
         # Show room-status dialog; host clicks "Continue to Setup" when ready
         room_dlg = HostRoomStatusDialog(room_code, self)
         # Chain dialog updates onto the MultiplayerHost-installed callbacks
@@ -261,6 +316,13 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Join failed", f"Could not join room {room_code}: {e}")
             self.close()
             return
+        # Re-key the local player under the signaling-assigned peer_id.
+        # Without this, both clients used the literal id "local" and
+        # warnings issued by either landed in the same bucket on the
+        # other client's session, so the team-visibility filter
+        # included them all.
+        if self._peer_transport.peer_id:
+            self._set_local_player_id(self._peer_transport.peer_id)
         # Build the peer wrapper (registers the message handler)
         self._multiplayer = MultiplayerPeer(self.session, self._peer_transport)
         # Show a "waiting for host setup..." placeholder while we wait

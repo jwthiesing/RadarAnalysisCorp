@@ -104,6 +104,59 @@ def test_opposing_team_warnings_hidden_from_push():
     assert "carol-1" not in visible_ids
 
 
+def test_distinct_solo_players_see_only_own_warnings():
+    """Regression for the "every client uses local_player_id == 'local'"
+    bug: when both clients used the same placeholder id, their warnings
+    collided on each other's session under that single key, and the
+    team-visibility filter trivially included them all. The fix re-keys
+    each client's local player under their signaling-assigned id; this
+    test asserts that with distinct ids, each solo player sees only
+    their own warnings."""
+    from radar_warning_game.geo.polygons import Polygon
+    from radar_warning_game.verification.reports_in_poly import (
+        Magnitudes, Warning, WarningRevision,
+    )
+    from radar_warning_game.verification.tornado_tiers import WarningType
+
+    sess = GameSession()
+    sess.add_player(Player(player_id="host-abc", display_name="HostUser", is_host=True))
+    sess.add_player(Player(player_id="peer-xyz", display_name="PeerUser"))
+    # ``add_player`` auto-creates a solo team per player. Verify so the
+    # test fails fast if that contract changes.
+    assert sess.players["host-abc"].team_id is not None
+    assert sess.players["peer-xyz"].team_id is not None
+    assert sess.players["host-abc"].team_id != sess.players["peer-xyz"].team_id
+
+    t0 = datetime(2024, 4, 1, 20, 0, tzinfo=timezone.utc)
+    poly = Polygon(((35.1, -97.4), (35.1, -97.1), (35.4, -97.1), (35.4, -97.4)))
+    def mkw(wid: str, issuer: str) -> Warning:
+        return Warning(
+            warning_id=wid, issuer_id=issuer, team_id=sess.players[issuer].team_id,
+            revisions=[WarningRevision(
+                revision_time=t0, warning_type=WarningType.TOR, polygon=poly,
+                duration=timedelta(minutes=30), magnitudes=Magnitudes(),
+            )],
+        )
+    sess.warnings_by_player["host-abc"] = [mkw("w-host", "host-abc")]
+    sess.warnings_by_player["peer-xyz"] = [mkw("w-peer", "peer-xyz")]
+
+    pushed_host: dict = {}
+    pv_host = _stub_play_view(sess, "host-abc")
+    pv_host.radar_grid = SimpleNamespace(
+        set_player_warnings=lambda w, m: pushed_host.update(w=w, m=m),
+    )
+    pv_host._push_player_overlays()
+    assert {w.warning_id for w in pushed_host["w"]} == {"w-host"}
+
+    pushed_peer: dict = {}
+    pv_peer = _stub_play_view(sess, "peer-xyz")
+    pv_peer.radar_grid = SimpleNamespace(
+        set_player_warnings=lambda w, m: pushed_peer.update(w=w, m=m),
+    )
+    pv_peer._push_player_overlays()
+    assert {w.warning_id for w in pushed_peer["w"]} == {"w-peer"}
+
+
 def test_missing_player_falls_back_to_self_only():
     """If the local player isn't yet in session.players (mid-join
     handshake), the helper degrades gracefully to ``[self]`` rather
