@@ -2979,9 +2979,23 @@ class RadarPanelGrid(QWidget):
         new volume lands in the sweep-index. Filter to our active
         site, then emit the Qt signal — connected in ``__init__`` with
         an auto-queued cross-thread connection — so the actual
-        QSlider mutation runs on the GUI thread."""
+        QSlider mutation runs on the GUI thread.
+
+        Also drops any stale PyART Radar object cached for ``file``.
+        The live-mode growth path reindexes the file after the IEM
+        mirror appends sweeps — the SweepIndex then references
+        sweep_numbers that don't exist in the partial-volume radar
+        object we parsed earlier, and the next render crashes with
+        ``IndexError: index 7 out of bounds`` on
+        ``radar.fixed_angle["data"][sweep_no]``. Drop the LRU entry so
+        the next render reads through ``_get_radar_from_cache`` →
+        prefetcher preload (which was invalidated alongside the
+        reindex) → fresh parse of the now-larger file. Safe on
+        first-time indexes too: the LRU entry simply doesn't exist
+        yet and ``pop`` is a no-op."""
         if site.upper() != self.site.icao.upper():
             return
+        self._radar_lru.pop(file, None)
         self._sweep_index_extended.emit()
 
     def _on_radar_preloaded(self, file: Path, radar) -> None:
