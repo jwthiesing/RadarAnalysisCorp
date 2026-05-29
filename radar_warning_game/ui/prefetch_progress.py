@@ -86,14 +86,26 @@ class PrefetchProgressWidget(QWidget):
         # is built every site's ``pregame_total`` is final — sites that
         # report 0 here have no archive data for the chosen day, which
         # is a permanent condition (not a "still listing" race).
+        #
+        # **Live mode is special**: the prefetcher polls the IEM live
+        # mirror for newly-arriving scans, so ``pregame_total`` is 0
+        # for every site at construction (no scans have streamed in
+        # yet). The "no archive data" diagnosis doesn't apply — live
+        # has no concept of "this day's archive is empty" — so we
+        # suppress the empty-sites logic entirely in live mode.
+        self._is_live = bool(getattr(self.prefetcher, "live_source", False))
         initial = self.prefetcher.pregame_progress()
-        self._empty_sites: set[str] = {
-            s for s, (_done, total) in initial.items() if total == 0
-        }
-        all_empty = (
-            bool(self.prefetcher.sites)
-            and len(self._empty_sites) == len(self.prefetcher.sites)
-        )
+        if self._is_live:
+            self._empty_sites = set()
+            all_empty = False
+        else:
+            self._empty_sites = {
+                s for s, (_done, total) in initial.items() if total == 0
+            }
+            all_empty = (
+                bool(self.prefetcher.sites)
+                and len(self._empty_sites) == len(self.prefetcher.sites)
+            )
 
         self._bars: dict[str, QProgressBar] = {}
         self._site_status_labels: dict[str, QLabel] = {}
@@ -229,12 +241,17 @@ class PrefetchProgressWidget(QWidget):
         self._timer.setInterval(500)
         self._timer.timeout.connect(self._poll)
         # Don't bother polling if there's literally nothing to download.
-        if not all_empty:
+        # Live mode always polls — scans stream in over wall-clock time
+        # and pregame_total starts at 0.
+        if self._is_live or not all_empty:
             self._timer.start()
 
     def _poll(self) -> None:
         progress = self.prefetcher.pregame_progress()
         preload_progress = self.prefetcher.pregame_preload_progress()
+        if self._is_live:
+            self._poll_live(progress, preload_progress)
+            return
         # Gate auto-advance on whether *non-empty* sites have finished
         # BOTH the download AND the PyART parse + velocity dealias.
         # Empty sites stay at 0/0 forever and would otherwise block
@@ -274,6 +291,41 @@ class PrefetchProgressWidget(QWidget):
                 bar.setFormat("(listing…)")
                 all_done = False
         if all_done and any_seen:
+            self._timer.stop()
+            self.local_prefetch_done.emit()
+
+    def _poll_live(self, progress, preload_progress) -> None:
+        """Live-mode polling: there's no "finished downloading"
+        terminal state — scans stream in over wall-clock time and
+        keep arriving once the round is underway. Advance as soon
+        as ANY site has at least one downloaded + preloaded volume,
+        so the player has something to display from the moment play
+        begins. Remaining sites continue to populate their bars in
+        the background even after we've advanced.
+
+        Visual: each bar shows ``download/preprocess: <done>`` (no
+        denominator — there's no fixed target in live mode).
+        Sites with no data yet read ``(waiting for live data…)``.
+        """
+        any_ready = False
+        for site, bar in self._bars.items():
+            done, _total = progress.get(site, (0, 0))
+            pl_done, _pl_total = preload_progress.get(site, (0, 0))
+            if done > 0:
+                bar.setRange(0, max(done, 1))
+                bar.setValue(done)
+                bar.setFormat(f"download: {done} (live)")
+                pl_bar = self._preload_bars[site]
+                pl_bar.setRange(0, max(done, 1))
+                pl_bar.setValue(pl_done)
+                pl_bar.setFormat(f"preprocess: {pl_done} (live)")
+                if pl_done >= 1:
+                    any_ready = True
+            else:
+                bar.setRange(0, 1)
+                bar.setValue(0)
+                bar.setFormat("(waiting for live data…)")
+        if any_ready:
             self._timer.stop()
             self.local_prefetch_done.emit()
 

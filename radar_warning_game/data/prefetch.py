@@ -160,6 +160,15 @@ class Prefetcher:
     def sites(self) -> list[str]:
         return list(self._states.keys())
 
+    @property
+    def live_source(self) -> bool:
+        """``True`` iff this prefetcher is wired to the IEM live mirror
+        (current real-time scans) rather than the historical S3 archive.
+        Read by UI consumers — e.g. ``PrefetchProgressWidget`` — that
+        need to short-circuit historical-archive checks (live mode has
+        no concept of "the chosen day has no archive data")."""
+        return self._live_source
+
     def sweep_index(self, site: str) -> SweepIndex:
         return self._states[site.upper()].sweep_index
 
