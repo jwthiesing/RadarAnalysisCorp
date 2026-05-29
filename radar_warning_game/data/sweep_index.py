@@ -105,6 +105,39 @@ class SweepIndex:
                 self._times.insert(pos, r.start_time)
         return len(new_refs)
 
+    def reindex_file(self, file: Path) -> int:
+        """Re-index ``file`` after its on-disk content changed.
+
+        Drops every ``SweepRef`` previously associated with ``file``,
+        clears the PyART metadata cache for it, and re-runs
+        ``index_volume_file`` against the new content. Returns the
+        number of sweeps in the refreshed index.
+
+        Used by the live-source prefetch path when an IEM mirror file
+        has grown — the partial first-version sweeps already in the
+        index are still valid for those rays, but the file now has
+        additional sweeps appended that we want indexed too. Cleanest
+        to drop and re-add than to diff sweep counts.
+        """
+        with self._lock:
+            kept_sweeps: list[SweepRef] = []
+            kept_times: list[datetime] = []
+            for ref, t in zip(self._sweeps, self._times):
+                if ref.file == file:
+                    continue
+                kept_sweeps.append(ref)
+                kept_times.append(t)
+            self._sweeps = kept_sweeps
+            self._times = kept_times
+            self._seen_files.discard(file)
+        # Drop the cached PyART metadata so re-indexing reads the new
+        # file content (the lru_cache memoizes by Path identity).
+        try:
+            index_volume_file.cache_clear()
+        except AttributeError:
+            pass
+        return self.add_file(file)
+
     def all_sweeps(self) -> list[SweepRef]:
         with self._lock:
             return list(self._sweeps)

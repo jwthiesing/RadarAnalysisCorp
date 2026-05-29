@@ -42,11 +42,21 @@ def s3_client():
 
 @dataclass(frozen=True)
 class ScanRef:
-    """A single volume scan listing entry."""
+    """A single volume scan listing entry.
+
+    ``size`` is the remote file size in bytes when the listing source
+    exposes one (currently only the IEM live mirror's directory
+    listings). 0 means "unknown / unavailable" — historical S3 listings
+    don't surface size cheaply and don't need it, since archived files
+    are immutable. The live mirror's files grow as the radar appends
+    new sweeps mid-volume, so we compare ``size`` against the local
+    cached file's size to decide whether to re-download.
+    """
 
     site: str          # ICAO
     time: datetime     # UTC, parsed from the filename
     key: str           # full S3 object key
+    size: int = 0      # bytes (0 == unknown)
 
 
 def list_volumes_for_day(site: str, day: datetime) -> list[ScanRef]:

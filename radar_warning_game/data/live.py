@@ -33,6 +33,38 @@ _LISTING_HREF_RE = re.compile(
     r'<a href="(?P<href>[A-Z]{4}_\d{8}_\d{4})">',
     re.IGNORECASE,
 )
+# Apache directory listings — IEM mirror format — render sizes in
+# HUMAN-READABLE units (``mod_autoindex`` ``IndexOptions
+# SuppressHTMLPreamble`` / default settings):
+#
+#   <td><a href="KTLX_20260527_1959">KTLX_20260527_1959</a></td>
+#   <td align="right">2026-05-27 15:04  </td>
+#   <td align="right">8.8M</td>
+#
+# So we look for a number-with-optional-K/M/G suffix in the size
+# column instead of raw integer bytes. A bare integer is accepted
+# too (some Apache configs emit raw bytes). The size tells the
+# prefetcher when a live file has grown since we last fetched it
+# (Level 2 files start small and accumulate sweeps as the radar
+# finishes the volume); without it we'd cache the partial first
+# version forever.
+_SIZE_FIND_RE = re.compile(
+    r"\b(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[KMG])?\b",
+    re.IGNORECASE,
+)
+
+_UNIT_BYTES = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+
+
+def _parse_size_token(num_str: str, unit: str | None) -> int:
+    """Convert a ``(num, unit)`` capture to bytes. ``unit`` is ``K``,
+    ``M``, ``G``, or ``None``/empty (bytes)."""
+    try:
+        n = float(num_str)
+    except (TypeError, ValueError):
+        return 0
+    mult = _UNIT_BYTES.get((unit or "").upper(), 1)
+    return int(n * mult)
 
 
 def _parse_filename(name: str) -> tuple[str, datetime] | None:
@@ -50,7 +82,13 @@ _HTTP_HEADERS = {"User-Agent": "RadarAnalysisCorp/0.1 (game; uses IEM live mirro
 
 
 def list_live_volumes(site: str, *, timeout: float = 30.0) -> list[ScanRef]:
-    """Scrape the IEM live directory for ``site`` and return ``ScanRef`` list."""
+    """Scrape the IEM live directory for ``site`` and return ``ScanRef``
+    entries, each carrying the remote file's byte size when the
+    listing exposes one. The prefetcher uses ``size`` to detect when
+    a live file has grown since it was last downloaded — Level 2
+    volumes accumulate sweeps for a few minutes after the radar
+    starts emitting them, and the first version we see is typically
+    just one or two sweeps."""
     site = site.upper()
     url = f"{BASE_URL}/{site}/"
     try:
@@ -59,24 +97,64 @@ def list_live_volumes(site: str, *, timeout: float = 30.0) -> list[ScanRef]:
     except requests.RequestException as e:
         log.warning("IEM live listing for %s failed: %s", site, e)
         return []
+    text = r.text
     refs: list[ScanRef] = []
-    for href in _LISTING_HREF_RE.findall(r.text):
+    for href_match in _LISTING_HREF_RE.finditer(text):
+        href = href_match.group("href")
         parsed = _parse_filename(href)
         if parsed is None:
             continue
         parsed_site, t = parsed
         if parsed_site != site:
             continue
-        refs.append(ScanRef(site=site, time=t, key=f"{site}/{href}"))
+        # Pull the substring from this href to the next href (or end
+        # of document) — the file size is the largest plausible
+        # number-with-unit in that span. Apache listings have
+        # ``<td>...size...</td>`` tags between hrefs, so isolating
+        # per-href substring keeps us from picking up a neighbor's
+        # size by accident.
+        span_start = href_match.end()
+        next_href = _LISTING_HREF_RE.search(text, span_start)
+        span_end = next_href.start() if next_href else len(text)
+        between = text[span_start:span_end]
+        size = 0
+        for s_match in _SIZE_FIND_RE.finditer(between):
+            candidate = _parse_size_token(s_match.group("num"), s_match.group("unit"))
+            # Plausible Level 2 file size: 100 KB to 500 MB. Skips
+            # date fragments (4-digit years), times (HHMM), and any
+            # other small numeric noise in the listing.
+            if 100_000 <= candidate <= 500_000_000 and candidate > size:
+                size = candidate
+        refs.append(ScanRef(site=site, time=t, key=f"{site}/{href}", size=size))
     refs.sort(key=lambda r: r.time)
     log.info("IEM live: %s — %d volumes available", site, len(refs))
     return refs
 
 
 def download_live_volume(scan: ScanRef, cache: HashedCache, *, timeout: float = 120.0) -> Path:
-    """Download a live volume (caching). Stores raw NEXRAD Level 2 bytes."""
+    """Download a live volume, caching to disk.
+
+    If the volume is already cached but the listing reports a larger
+    remote size (the radar appended more sweeps after our first
+    download), the cached file is overwritten with the full current
+    version. Without this re-download path we'd be stuck with a
+    partial Level 2 file containing only the first one or two
+    sweeps of a 5-minute volume.
+    """
     if cache.exists(scan.key):
-        return cache.path(scan.key)
+        local = cache.path(scan.key)
+        try:
+            local_size = local.stat().st_size
+        except OSError:
+            local_size = 0
+        # Size unknown (size=0) or remote not larger → keep cached.
+        # Strict ``>`` so equal sizes don't trigger pointless re-fetch.
+        if scan.size <= 0 or local_size >= scan.size:
+            return local
+        log.debug(
+            "IEM live: re-downloading %s (cached %d bytes < remote %d bytes)",
+            scan.key, local_size, scan.size,
+        )
     url = f"{BASE_URL}/{scan.key}"
     tmp = cache.temp_path(scan.key)
     tmp.parent.mkdir(parents=True, exist_ok=True)

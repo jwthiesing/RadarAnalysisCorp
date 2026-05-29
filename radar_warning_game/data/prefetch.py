@@ -73,6 +73,12 @@ class RadarPrefetchState:
     # block the round forever.
     preload_scheduled: int = 0
     preload_completed: int = 0
+    # Live-mode growth tracking: scan.key → byte size of the cached
+    # file as of its most recent download. The next time the listing
+    # reports a larger remote size we know the radar appended sweeps
+    # to that volume and we need to re-fetch + re-index. Empty for
+    # historical sources (S3 files are immutable).
+    downloaded_sizes: dict[str, int] = field(default_factory=dict)
 
 
 class Prefetcher:
@@ -418,7 +424,27 @@ class Prefetcher:
     def _submit_if_new(self, state: RadarPrefetchState, scan: ScanRef) -> Future | None:
         with self._lock:
             already_cached_on_disk = state.cache.exists(scan.key)
-            if scan.key in state.in_flight or already_cached_on_disk:
+            # ``in_flight`` is only "currently downloading" if the
+            # tracked future hasn't completed yet. We deliberately don't
+            # pop completed entries (``pregame_progress`` walks the dict
+            # and counts ``f.done()`` to compute per-site progress), so
+            # the dict naturally accumulates finished futures — checking
+            # ``.done()`` here lets a fresh re-submit fire for live-mode
+            # growth detection without a separate cleanup pass.
+            existing_fut = state.in_flight.get(scan.key)
+            in_flight = existing_fut is not None and not existing_fut.done()
+            # Live-mode growth check: a cached file that the listing
+            # reports as having grown since our last fetch needs to
+            # be re-downloaded, re-indexed, and re-preloaded. The
+            # NEXRAD radar appends sweeps to a Level 2 file over the
+            # ~5 min of a volume; if we only see the first version
+            # we get one or two sweeps instead of fourteen.
+            grew = False
+            if self._live_source and already_cached_on_disk and not in_flight:
+                prev_size = state.downloaded_sizes.get(scan.key, 0)
+                if scan.size > 0 and scan.size > prev_size:
+                    grew = True
+            if in_flight or (already_cached_on_disk and not grew):
                 if already_cached_on_disk and scan.time not in state.downloaded_scan_times:
                     # File was on disk before we started — record + index it now.
                     state.downloaded_scan_times.add(scan.time)
@@ -442,13 +468,39 @@ class Prefetcher:
 
     def _download_and_index(self, state: RadarPrefetchState, scan: ScanRef) -> Path:
         try:
+            with self._lock:
+                cache_existed = state.cache.exists(scan.key)
+                prev_size = state.downloaded_sizes.get(scan.key, 0)
             if self._live_source:
                 local = download_live_volume(scan, state.cache)
             else:
                 local = download_volume(scan, state.cache)
-            state.sweep_index.add_file(local)
+            # Detect whether the file actually grew on disk. If so,
+            # we need to drop and re-add it from the sweep-index and
+            # invalidate any preloaded PyART Radar object that was
+            # built off the partial version.
+            try:
+                new_size = local.stat().st_size
+            except OSError:
+                new_size = 0
+            file_grew = (
+                self._live_source
+                and cache_existed
+                and new_size > 0
+                and new_size > prev_size
+            )
+            if file_grew:
+                # Invalidate the preload cache so the next scrub re-
+                # parses the now-larger file.
+                with self._lock:
+                    self._loaded_radars.pop(local, None)
+                    self._preload_futures.pop(local, None)
+                state.sweep_index.reindex_file(local)
+            else:
+                state.sweep_index.add_file(local)
             with self._lock:
                 state.downloaded_scan_times.add(scan.time)
+                state.downloaded_sizes[scan.key] = new_size
             # Tell any UI consumer that new sweeps are scrubbable for
             # this site — fired BEFORE the preload so the scrubber UI
             # picks up the new range without waiting for parse+dealias.
