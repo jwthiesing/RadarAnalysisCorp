@@ -19,6 +19,7 @@ from radar_warning_game.verification.scoring import (
     BASE_SVR_POINTS,
     BASE_TOR_FA_PENALTY,
     BASE_TOR_POINTS,
+    EXTRA_VERIFY_BONUS,
     MAG_ACCURACY_WEIGHT,
     score_round,
     score_single_mcd,
@@ -590,3 +591,199 @@ def test_per_hazard_mcd_lead_zero_for_unverified_predicted_hazard():
     ms = score_single_mcd(m, reports)
     # Tornado lead = 60 pts; hail = 0 (unverified) → mean = 30
     assert ms.lead_bonus == pytest.approx(30.0, abs=1.0)
+
+
+# ---- per-extra-report verification bonus -------------------------
+
+
+def test_single_verifying_report_gets_no_extra_bonus():
+    """The bonus only applies to reports BEYOND the first; a single-report
+    verification matches the pre-bonus point total."""
+    w = _w(wt=WarningType.TOR, mag=Magnitudes(ef=2.0))
+    r = _r(magnitude=2.0)
+    ws = score_single_warning(w, [r])
+    assert ws.extra_verify_bonus == 0.0
+    assert ws.points == pytest.approx(BASE_TOR_POINTS * 1.5)
+
+
+def test_extra_verifying_reports_each_add_bonus_tor():
+    """Three tornado reports against a TOR: first is base score, next two
+    each add the TOR per-extra-report bonus."""
+    w = _w(wt=WarningType.TOR)
+    rs = [
+        _r(category="tornado", magnitude=1.0, time=_T0+timedelta(minutes=5)),
+        _r(category="tornado", magnitude=1.0, time=_T0+timedelta(minutes=10)),
+        _r(category="tornado", magnitude=1.0, time=_T0+timedelta(minutes=15)),
+    ]
+    ws = score_single_warning(w, rs)
+    expected_extra = 2 * EXTRA_VERIFY_BONUS["TOR"]
+    assert ws.extra_verify_bonus == pytest.approx(expected_extra)
+    # base TOR (tier 1.0, no magnitude tag → mag_bonus 0) + 2 × extra
+    assert ws.points == pytest.approx(BASE_TOR_POINTS + expected_extra)
+
+
+def test_extra_bonus_higher_for_tor_than_svr():
+    """Same number of extra verifying reports, TOR scores more per extra
+    than SVR — preserves the TOR > SVR ordering."""
+    w_tor = _w(wid="t", wt=WarningType.TOR)
+    w_svr = _w(wid="s", wt=WarningType.SVR, mag=Magnitudes(hail_in=1.0))
+    tor_reports = [
+        _r(category="tornado", magnitude=1.0, time=_T0+timedelta(minutes=5)),
+        _r(category="tornado", magnitude=1.0, time=_T0+timedelta(minutes=10)),
+    ]
+    svr_reports = [
+        _r(category="hail", magnitude=1.0, time=_T0+timedelta(minutes=5)),
+        _r(category="hail", magnitude=1.0, time=_T0+timedelta(minutes=10)),
+    ]
+    ws_tor = score_single_warning(w_tor, tor_reports)
+    ws_svr = score_single_warning(w_svr, svr_reports)
+    assert ws_tor.extra_verify_bonus > ws_svr.extra_verify_bonus
+    assert ws_tor.extra_verify_bonus == pytest.approx(EXTRA_VERIFY_BONUS["TOR"])
+    assert ws_svr.extra_verify_bonus == pytest.approx(EXTRA_VERIFY_BONUS["SVR"])
+
+
+def test_extra_bonus_table_orders_tor_family_above_severe_family():
+    """Every TOR-family tier scores at least as much per extra report
+    as every SVR-family tier. Base TOR coincides with SVRD by design
+    (a tornado that didn't get upgraded is equivalent in points to a
+    destructive severe storm)."""
+    severe_max = max(EXTRA_VERIFY_BONUS[k] for k in ("SVR", "SVRC", "SVRD"))
+    tor_min   = min(EXTRA_VERIFY_BONUS[k] for k in ("TOR", "TORR", "PDS_TOR", "TORE"))
+    assert tor_min >= severe_max
+
+
+def test_extra_bonus_escalates_with_severe_tier():
+    """SVRC > SVR and SVRD > SVRC for per-extra-report bonus."""
+    assert EXTRA_VERIFY_BONUS["SVRC"] > EXTRA_VERIFY_BONUS["SVR"]
+    assert EXTRA_VERIFY_BONUS["SVRD"] > EXTRA_VERIFY_BONUS["SVRC"]
+
+
+def test_extra_bonus_escalates_with_tornado_tier():
+    """Tornado-family bonus is monotonic non-decreasing across tiers.
+    PDS_TOR (TORP) and TORE strictly exceed their predecessors — those
+    are the tiers the per-report downgrade specifically protects."""
+    assert EXTRA_VERIFY_BONUS["TORR"] >= EXTRA_VERIFY_BONUS["TOR"]
+    assert EXTRA_VERIFY_BONUS["PDS_TOR"] > EXTRA_VERIFY_BONUS["TORR"]
+    assert EXTRA_VERIFY_BONUS["TORE"] > EXTRA_VERIFY_BONUS["PDS_TOR"]
+
+
+def test_extra_bonus_uses_revision_active_at_each_report():
+    """An SVR upgraded to SVRD mid-event: the second verifying report
+    lands after the upgrade and earns the SVRD-tier bonus, not the
+    SVR-tier bonus."""
+    upgrade_time = _T0 + timedelta(minutes=7)
+    extra_rev = WarningRevision(
+        revision_time=upgrade_time,
+        warning_type=WarningType.SVRD,
+        polygon=_WARN_POLY,
+        duration=timedelta(minutes=30),
+        magnitudes=Magnitudes(hail_in=3.0, wind_mph=80),
+    )
+    w = _w(wt=WarningType.SVR, mag=Magnitudes(hail_in=1.5, wind_mph=60),
+           revisions_extra=[extra_rev])
+    rs = [
+        _r(category="hail", magnitude=1.5, time=_T0+timedelta(minutes=5)),    # SVR-era
+        _r(category="hail", magnitude=3.0, time=_T0+timedelta(minutes=10)),   # SVRD-era
+    ]
+    ws = score_single_warning(w, rs)
+    # First report was SVR-era; second (extra) is SVRD-era → SVRD bonus
+    assert ws.extra_verify_bonus == pytest.approx(EXTRA_VERIFY_BONUS["SVRD"])
+
+
+def test_extra_bonus_orders_reports_by_time_not_input():
+    """Inputs in reverse-time order still treat the earliest as the
+    'first' and apply the bonus to the rest."""
+    w = _w(wt=WarningType.TOR)
+    early = _r(category="tornado", magnitude=1.0, time=_T0+timedelta(minutes=5))
+    late  = _r(category="tornado", magnitude=1.0, time=_T0+timedelta(minutes=15))
+    ws_in_order  = score_single_warning(w, [early, late])
+    ws_reversed  = score_single_warning(w, [late, early])
+    assert ws_in_order.extra_verify_bonus == ws_reversed.extra_verify_bonus
+    assert ws_in_order.points == pytest.approx(ws_reversed.points)
+
+
+def test_extra_bonus_weak_tornado_in_pds_tor_scores_at_tor_tier():
+    """A PDS_TOR earns its 100-pt extra bonus only when the *report*
+    qualifies as a significant tornado (EF≥2 or casualties). A weak
+    EF0 follow-up tornado earns the base TOR-tier bonus instead — 50
+    pts — because it doesn't satisfy the 'particularly dangerous'
+    criterion the warning made the bigger claim about."""
+    w = _w(wt=WarningType.PDS_TOR)
+    rs = [
+        _r(category="tornado", magnitude=3.0, time=_T0+timedelta(minutes=5)),    # initial: significant
+        _r(category="tornado", magnitude=0.0, time=_T0+timedelta(minutes=10)),   # extra: weak EF0
+    ]
+    ws = score_single_warning(w, rs)
+    assert ws.extra_verify_bonus == pytest.approx(EXTRA_VERIFY_BONUS["TOR"])
+
+
+def test_extra_bonus_significant_tornado_in_pds_tor_scores_at_pds_tier():
+    """If the follow-up tornado IS significant (EF≥2 or has casualties),
+    the player earns the full PDS_TOR-tier bonus."""
+    w = _w(wt=WarningType.PDS_TOR)
+    rs = [
+        _r(category="tornado", magnitude=2.0, time=_T0+timedelta(minutes=5)),
+        _r(category="tornado", magnitude=3.0, time=_T0+timedelta(minutes=10)),
+    ]
+    ws = score_single_warning(w, rs)
+    assert ws.extra_verify_bonus == pytest.approx(EXTRA_VERIFY_BONUS["PDS_TOR"])
+
+
+def test_extra_bonus_casualties_make_weak_tornado_count_as_pds():
+    """A weak tornado that caused casualties (injury or fatality) still
+    meets the 'significant' criterion — earns the full PDS_TOR bonus."""
+    w = _w(wt=WarningType.PDS_TOR)
+    rs = [
+        _r(category="tornado", magnitude=2.0, time=_T0+timedelta(minutes=5)),
+        _r(category="tornado", magnitude=1.0, time=_T0+timedelta(minutes=10), inj=2),
+    ]
+    ws = score_single_warning(w, rs)
+    assert ws.extra_verify_bonus == pytest.approx(EXTRA_VERIFY_BONUS["PDS_TOR"])
+
+
+def test_extra_bonus_weak_tornado_in_tore_scores_at_tor_tier():
+    """Same downgrade logic for TORE: a weak follow-up tornado earns
+    the TOR-tier bonus, not the TORE bonus."""
+    w = _w(wt=WarningType.TORE)
+    rs = [
+        _r(category="tornado", magnitude=3.0, time=_T0+timedelta(minutes=5)),
+        _r(category="tornado", magnitude=1.0, time=_T0+timedelta(minutes=10)),
+    ]
+    ws = score_single_warning(w, rs)
+    assert ws.extra_verify_bonus == pytest.approx(EXTRA_VERIFY_BONUS["TOR"])
+
+
+def test_extra_bonus_subsvrd_hail_in_svrd_scores_at_lower_tier():
+    """Sub-SVRD-threshold hail (e.g. 2.0", which meets SVRC but not
+    SVRD) inside an SVRD earns the SVRC-tier bonus on the extra
+    report. Sub-SVRC hail (e.g. 1.0") earns the SVR-tier bonus."""
+    w_svrd = _w(wid="d", wt=WarningType.SVRD, mag=Magnitudes(hail_in=3.0))
+    # First report: SVRD-qualifying. Second: SVRC-qualifying (2.0", ≥1.75 but <2.75).
+    rs_svrc_extra = [
+        _r(category="hail", magnitude=3.0, time=_T0+timedelta(minutes=5)),
+        _r(category="hail", magnitude=2.0, time=_T0+timedelta(minutes=10)),
+    ]
+    ws = score_single_warning(w_svrd, rs_svrc_extra)
+    assert ws.extra_verify_bonus == pytest.approx(EXTRA_VERIFY_BONUS["SVRC"])
+    # And sub-SVRC hail (1.0", ≥1.0 SVR threshold but <SVRC) drops to SVR tier.
+    w_svrd2 = _w(wid="d2", wt=WarningType.SVRD, mag=Magnitudes(hail_in=3.0))
+    rs_svr_extra = [
+        _r(category="hail", magnitude=3.0, time=_T0+timedelta(minutes=5)),
+        _r(category="hail", magnitude=1.0, time=_T0+timedelta(minutes=10)),
+    ]
+    ws2 = score_single_warning(w_svrd2, rs_svr_extra)
+    assert ws2.extra_verify_bonus == pytest.approx(EXTRA_VERIFY_BONUS["SVR"])
+
+
+def test_extra_bonus_only_counts_claimed_hazards():
+    """An SVR predicted only hail. Two hail reports verify; a wind report
+    (not claimed) does NOT contribute an extra-report bonus."""
+    w = _w(wt=WarningType.SVR, mag=Magnitudes(hail_in=1.5))
+    rs = [
+        _r(category="hail", magnitude=1.5, time=_T0+timedelta(minutes=5)),
+        _r(category="hail", magnitude=1.5, time=_T0+timedelta(minutes=10)),
+        _r(category="wind", magnitude=70, time=_T0+timedelta(minutes=15)),
+    ]
+    ws = score_single_warning(w, rs)
+    # Exactly one extra (the second hail), not two
+    assert ws.extra_verify_bonus == pytest.approx(EXTRA_VERIFY_BONUS["SVR"])

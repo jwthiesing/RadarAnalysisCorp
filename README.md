@@ -154,6 +154,8 @@ The host-only **Central Map** (multiplayer) additionally shows every player's wa
 For each verified warning:
 ```
 points = mean(per_match_tier_mult) × (1 + magnitude_bonus) × base_pts
+       + extra_verify_bonus
+       + tornado_possible_bonus    (SVR-TP only, see below)
 ```
 
 Each verifying report contributes a tier multiplier based on the **revision active at the report's time**. Upgrading a warning SVR → TOR mid-event earns the upgraded multiplier only for reports that arrive after the upgrade.
@@ -169,6 +171,20 @@ Each verifying report contributes a tier multiplier based on the **revision acti
 | **TORE** | 2.5× (if EF ≥ 2 OR casualties; 0.75× if only weak tornado) | **3.0×** (heaviest in game) |
 
 **Magnitude bonus** is the mean of hail/wind/EF accuracy components. **Predicted-but-unverified hazards contribute 0** to that mean — predict only what you expect. (So an SVR with predicted hail=2.0" + wind=100 mph that verifies only via hail scores half the mag bonus of one with verified hail + matching wind prediction.)
+
+**Per-extra-report bonus.** A warning that catches multiple verifying reports earns a flat per-extra-report bonus on top of the base verified score. The first verifying report counts toward the base formula; each *additional* report adds the bonus below. The bonus is keyed by the **effective tier the report actually verifies**, not the warning's claimed tier — a weak EF0/EF1 tornado inside a PDS TOR or TORE scores at the TOR tier (100), not the PDS/TORE tier, because it didn't meet the significant-tornado threshold. Same on the severe side: a 2.0" hail report inside an SVRD earns the SVRC tier (50, since 2.0" ≥ 1.75" but < 2.75"); 1.0" hail in an SVRD earns the SVR tier (25).
+
+| Tier (effective verification) | Per-extra-report bonus |
+|---|---|
+| **SVR** | 25 |
+| **SVRC** | 50 |
+| **SVRD** | 100 |
+| **TOR** | 100 |
+| **TORR** | 100 |
+| **PDS TOR** (TORP) | 250 |
+| **TORE** | 500 |
+
+The downgrade logic means tornado reports inside a TOR-family warning always earn at least the base TOR bonus (100) — a player who issued a tornado warning of any tier and gets multiple tornadoes is rewarded per-tornado at TOR or higher, never penalized for over-claiming the tier. The over-issuance penalty for TORE-claimed-but-only-weak verification is handled by the existing 0.75× tier multiplier on the *base* score, not by suppressing this bonus.
 
 POD denominator uses the game polygon with the same 5 km verification buffer, so reports just outside the strict polygon edge that verify a warning also count in the denominator (symmetric accounting). **Both IEM-sourced and SVRGIS-sourced reports** count toward POD — scoring is source-agnostic.
 
@@ -398,7 +414,7 @@ radar_warning_game/
 signaling_server/
 └── server.py               # aiohttp WebSocket server for room codes + SDP exchange
 
-tests/                      # 261 pytest tests across 20 files
+tests/                      # 370 pytest tests across 28 files
 ```
 
 ---
@@ -410,7 +426,7 @@ pip install -e ".[dev]"
 python -m pytest tests/ -q
 ```
 
-269 tests covering: SAILS sweep index, 5-km buffered point-in-polygon, scoring metrics (incl. team aggregation, magnitude revisions, per-revision tier), tier multipliers, MCD PIB scoring and anti-spam, protocol round-trip, multiplayer state appliers, date-blinding scrape, casualty regex, cache, clock, session state machine, replay, event reveal, colors, sites, live source, round builder. Runs in ~2 seconds.
+370 tests covering: SAILS sweep index, 5-km buffered point-in-polygon, scoring metrics (incl. team aggregation, magnitude revisions, per-revision tier, per-extra-report bonus with tier downgrade), tier multipliers, MCD PIB scoring and anti-spam, protocol round-trip, multiplayer state appliers, date-blinding scrape, casualty regex, cache, clock, session state machine, replay, event reveal, colors, sites, live source, round builder. Runs in ~3 seconds.
 
 GitHub Actions CI at [`.github/workflows/test.yml`](.github/workflows/test.yml) runs the suite on Python 3.11 and 3.12 with Qt offscreen + cartopy system deps.
 

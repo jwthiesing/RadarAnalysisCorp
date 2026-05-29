@@ -39,6 +39,10 @@ from .reports_in_poly import (
 )
 from .tornado_tiers import (
     PDS_TOR_MIN_EF,
+    SVRC_HAIL_THRESHOLD_IN,
+    SVRC_WIND_THRESHOLD_MPH,
+    SVRD_HAIL_THRESHOLD_IN,
+    SVRD_WIND_THRESHOLD_MPH,
     WarningType,
     severe_tier_multiplier,
     tornado_tier_multiplier,
@@ -62,6 +66,32 @@ MAG_ACCURACY_WEIGHT = 0.5   # max boost from perfect magnitude prediction (0 →
 # if neither hail nor wind verified.
 SVR_TORNADO_POSSIBLE_BONUS = 80.0
 
+# Per-extra-verifying-report bonus, keyed by the **effective tier the
+# report actually verifies** (see ``_effective_verify_tier`` — a weak
+# EF0/EF1 tornado inside a PDS_TOR or TORE earns the TOR-tier bonus
+# here, not the claimed-tier bonus, since it doesn't satisfy the
+# significant-tornado criterion). The first verifying report earns the
+# standard tier × magnitude × base-points reward; each *additional*
+# report adds the bonus below.
+#
+# Ordering invariants:
+#   - Monotonic non-decreasing within a family.
+#   - Every TOR-family tier ≥ every SVR-family tier (a tornado is at
+#     least as big an event as any severe-storm verification). TOR and
+#     SVRD coincide at 100 — the player got a tornado, but only at the
+#     base TOR level, which we treat as equivalent to a destructive
+#     severe storm.
+# Tunable.
+EXTRA_VERIFY_BONUS = {
+    "SVR":      25.0,
+    "SVRC":     50.0,
+    "SVRD":    100.0,
+    "TOR":     100.0,
+    "TORR":    100.0,
+    "PDS_TOR": 250.0,
+    "TORE":    500.0,
+}
+
 # MCD scoring
 MCD_PIB_PERFECT_HAZARD_POINTS = 80.0  # per hazard for delta=0 (max accuracy)
 MCD_PIB_FA_PENALTY_PER_PIB = 20.0    # for predicting PIB N when observed=0; scales with N
@@ -84,6 +114,7 @@ class WarningScore:
     magnitude_bonus: float          # 0..MAG_ACCURACY_WEIGHT
     points: float                   # signed: positive if verified, negative if FA
     is_false_alarm: bool
+    extra_verify_bonus: float = 0.0  # sum of per-extra-report bonuses (see EXTRA_VERIFY_BONUS)
 
 
 @dataclass
@@ -335,6 +366,56 @@ def _magnitude_accuracy(
     return sum(components) / len(components) if components else 0.0
 
 
+def _extra_verify_bonus_for_type(warning_type: WarningType) -> float:
+    """Per-extra-report bonus for ``warning_type``. Looked up from
+    :data:`EXTRA_VERIFY_BONUS`; unknown types (shouldn't happen) return
+    0 to avoid crashing scoring on a forward-compat type addition."""
+    return EXTRA_VERIFY_BONUS.get(warning_type.value, 0.0)
+
+
+def _effective_verify_tier(warning_type: WarningType, match: VerifyingMatch) -> WarningType:
+    """Tier that ``match.report`` actually verifies — possibly lower than
+    the warning's claimed type.
+
+    A weak EF0/EF1 tornado inside a PDS_TOR or TORE is still a tornado
+    (it verifies the warning at all), but it doesn't satisfy the
+    "significant tornado" criterion that PDS/TORE asks for. We score
+    it at the TOR tier — the lowest tier whose verification criteria
+    the report does meet. Same logic on the severe side: a 1.0"
+    hail report inside an SVRD verifies it as a base SVR, not SVRD.
+
+    For the **per-extra-report bonus** this is what we want — give the
+    player credit for the magnitude they actually got, not the
+    magnitude they claimed. (The base-score tier multiplier in
+    ``_tier_multiplier_for_match`` handles the over-issuance penalty
+    separately, e.g. TORE's 0.75× for weak verification.)
+    """
+    r = match.report
+    if warning_type.is_tornado_family:
+        ef = r.magnitude if r.category == "tornado" else -1.0
+        casualties = r.injuries + r.fatalities
+        significant = (ef >= PDS_TOR_MIN_EF) or (casualties > 0)
+        if warning_type in (WarningType.PDS_TOR, WarningType.TORE):
+            return warning_type if significant else WarningType.TOR
+        # TOR / TORR don't have a significance ladder — they verify as-claimed.
+        return warning_type
+    if warning_type.is_severe_family:
+        hail = r.magnitude if r.category == "hail" else 0.0
+        wind = r.magnitude if r.category == "wind" else 0.0
+        meets_svrd = hail >= SVRD_HAIL_THRESHOLD_IN or wind >= SVRD_WIND_THRESHOLD_MPH
+        meets_svrc = hail >= SVRC_HAIL_THRESHOLD_IN or wind >= SVRC_WIND_THRESHOLD_MPH
+        if warning_type == WarningType.SVRD:
+            if meets_svrd:
+                return WarningType.SVRD
+            if meets_svrc:
+                return WarningType.SVRC
+            return WarningType.SVR
+        if warning_type == WarningType.SVRC:
+            return WarningType.SVRC if meets_svrc else WarningType.SVR
+        return WarningType.SVR
+    return warning_type
+
+
 def _tier_multiplier_for_match(warning_type: WarningType, match: VerifyingMatch) -> float:
     """Per-match tier multiplier — uses ``warning_type`` (the revision active at
     report time) plus the report's own severity to decide if PDS/TORE bonuses fire.
@@ -446,7 +527,23 @@ def score_single_warning(warning: Warning, reports: list[Report]) -> WarningScor
         # the tp_bonus contributes.
         mean_tier = 1.0
         base_score = 0.0
-    points = base_score + tp_bonus
+    # Per-extra-report bonus: each verifying report beyond the first
+    # adds a tier-scaled flat bonus. The tier used is the **effective
+    # tier the report actually verifies** (see ``_effective_verify_tier``),
+    # which may be lower than the warning's claimed tier — a weak
+    # tornado inside a PDS_TOR earns the TOR bonus, not the PDS_TOR
+    # bonus. Revision-aware (the revision active at the report's time
+    # is the basis for the downgrade check), so an SVR→SVRC upgrade
+    # scales reports that landed post-upgrade. Sort by report.time so
+    # "first" is unambiguously the earliest verifying report regardless
+    # of input order.
+    extra_bonus = 0.0
+    if len(scoring_matches) >= 2:
+        ordered = sorted(scoring_matches, key=lambda m: m.report.time)
+        for m in ordered[1:]:
+            effective = _effective_verify_tier(m.revision.warning_type, m)
+            extra_bonus += _extra_verify_bonus_for_type(effective)
+    points = base_score + tp_bonus + extra_bonus
     return WarningScore(
         warning=warning, verifying=matches,
         tier_mult=mean_tier,
@@ -454,6 +551,7 @@ def score_single_warning(warning: Warning, reports: list[Report]) -> WarningScor
         magnitude_bonus=mag_bonus,
         points=points,
         is_false_alarm=False,
+        extra_verify_bonus=extra_bonus,
     )
 
 
